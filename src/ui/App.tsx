@@ -15,7 +15,7 @@ import { Building } from "@/components/map/Processing";
 import { ChevronLeft, ChevronRight, Download, Loader2, Search } from "lucide-react";
 import L from "leaflet";
 import { useAreaStore } from "@/state/areaStore";
-import type { PolygonRing, PolylineElem } from "@/state/areaStore";
+import type { IndoorFeature, PolygonRing, PolylineElem } from "@/state/areaStore";
 import { useActionStore } from "@/state/exportStore";
 import { Modal } from "@/components/modal/Modal";
 import { TopNav } from "@/components/nav/TopNav";
@@ -82,6 +82,8 @@ function App() {
   const [areaData, setAreaData] = useState([]);
   const [steps, setSteps] = useState(["front", "processing"]);
   const [step, setStep] = useState(0);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [cameraView, setCameraView] = useState<"orbit" | "topdown" | "walkthrough">("orbit");
   const [isWarnModal, setIsWarnModal] = useState(false);
   const [isExportModal, setIsExportModal] = useState(false);
   const [isFleetLogin, setIsFleetLogin] = useState(false);
@@ -90,6 +92,9 @@ function App() {
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [isFetchingBuildings, setIsFetchingBuildings] = useState(false);
   const [hasFetchedBuildings, setHasFetchedBuildings] = useState(false);
+  const [indoorDataStatus, setIndoorDataStatus] = useState<
+    "idle" | "loading" | "loaded" | "error"
+  >("idle");
   const [searchQuery, setSearchQuery] = useState("");
   const [isSearching, setIsSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
@@ -110,6 +115,7 @@ function App() {
   const setCenter = useAreaStore((state) => state.setCenter);
   const appendAreas = useAreaStore((state) => state.appendAreas);
   const setRoads = useAreaStore((state) => state.setRoads);
+  const setIndoorFeatures = useAreaStore((state) => state.setIndoorFeatures);
   const setParks = useAreaStore((state) => state.setParks);
   const setWaterPolygons = useAreaStore((state) => state.setWaterPolygons);
   const setRivers = useAreaStore((state) => state.setRivers);
@@ -184,6 +190,8 @@ function App() {
     setIsNextButtonDisabled(false);
     setBuildings([]);
     setHasFetchedBuildings(false);
+    setIndoorFeatures([]);
+    setIndoorDataStatus("idle");
   };
 
   const handleRemove = () => {
@@ -191,6 +199,8 @@ function App() {
     setIsNextButtonDisabled(true);
     setBuildings([]);
     setHasFetchedBuildings(false);
+    setIndoorFeatures([]);
+    setIndoorDataStatus("idle");
   };
 
   const handleSearch = async () => {
@@ -220,6 +230,7 @@ function App() {
 
   const requestBuildings = async (): Promise<boolean> => {
     setIsFetchingBuildings(true);
+    setIndoorDataStatus("loading");
     setFetchError("");
     setBuildProgress(0);
     setBuildStatus("Fetching map data from OpenStreetMap...");
@@ -258,6 +269,13 @@ function App() {
       `way["building"](${bbox});` +
       `relation["building"](${bbox});` +
       `way["highway"](${bbox});` +
+      // Indoor mapping and building parts are optional OSM features.
+      `nwr["indoor"~"^(room|corridor|wall|door|window|ceiling|level)$"](${bbox});` +
+      `nwr["level"](${bbox});` +
+      `nwr["entrance"](${bbox});` +
+      `nwr["door"](${bbox});` +
+      `nwr["window"](${bbox});` +
+      `nwr["building:part"](${bbox});` +
       // ── water ─────────────────────────────────────────
       `way["natural"="water"](${bbox});` +
       `relation["natural"="water"](${bbox});` +
@@ -281,12 +299,35 @@ function App() {
       `way["landuse"="parking"](${bbox});` +
     `);out body geom;`;
     try {
-      const response = await fetch("https://overpass-api.de/api/interpreter", {
-        method: "POST",
-        body: query,
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      });
-      if (!response.ok) throw new Error(`Server responded with ${response.status}`);
+      const endpoints = [
+        import.meta.env.VITE_OVERPASS_API_URL ||
+          "https://overpass-api.de/api/interpreter",
+        import.meta.env.VITE_OVERPASS_FALLBACK_URL ||
+          "https://overpass.kumi.systems/api/interpreter",
+      ].filter((endpoint, index, list) => list.indexOf(endpoint) === index);
+      let response: Response | null = null;
+      const endpointErrors: string[] = [];
+      for (const endpoint of endpoints) {
+        try {
+          const attempt = await fetch(endpoint, {
+            method: "POST",
+            body: query,
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          });
+          if (attempt.ok) {
+            response = attempt;
+            break;
+          }
+          endpointErrors.push(`${endpoint}: HTTP ${attempt.status}`);
+        } catch (error) {
+          endpointErrors.push(
+            `${endpoint}: ${error instanceof Error ? error.message : "request failed"}`
+          );
+        }
+      }
+      if (!response) {
+        throw new Error(`All Overpass endpoints failed. ${endpointErrors.join("; ")}`);
+      }
       const data = await response.json();
 
       const blds: Building[] = data.elements
@@ -298,6 +339,60 @@ function App() {
             ? element.geometry.map((pt: any) => ({ lat: pt.lat, lng: pt.lon }))
             : undefined,
         }));
+
+      const indoorFeatures: IndoorFeature[] = data.elements.flatMap((element: any) => {
+        const tags = element.tags ?? {};
+        const isIndoorFeature = [
+          "room",
+          "corridor",
+          "wall",
+          "door",
+          "window",
+          "ceiling",
+          "level",
+        ].includes(tags.indoor);
+        const isIndoorRelated =
+          isIndoorFeature ||
+          Boolean(tags.level) ||
+          Boolean(tags.entrance) ||
+          Boolean(tags.door) ||
+          Boolean(tags.window) ||
+          Boolean(tags["building:part"]);
+        if (!isIndoorRelated) return [];
+
+        const paths: IndoorFeature["paths"] = [];
+        if (
+          element.type === "node" &&
+          Number.isFinite(element.lat) &&
+          Number.isFinite(element.lon)
+        ) {
+          paths.push({
+            role: "point",
+            points: [{ lat: element.lat, lon: element.lon }],
+          });
+        } else if (Array.isArray(element.geometry)) {
+          paths.push({
+            role: element.geometry.length >= 4 ? "outer" : "line",
+            points: element.geometry.map((point: any) => ({
+              lat: point.lat,
+              lon: point.lon,
+            })),
+          });
+        } else if (Array.isArray(element.members)) {
+          for (const member of element.members) {
+            if (!Array.isArray(member.geometry) || member.geometry.length < 2) continue;
+            paths.push({
+              role: member.role || "line",
+              points: member.geometry.map((point: any) => ({
+                lat: point.lat,
+                lon: point.lon,
+              })),
+            });
+          }
+        }
+
+        return [{ id: element.id, type: element.type, tags, paths }];
+      });
 
       const rdElems = data.elements
         .filter((el: any) => el.tags?.highway && el.geometry?.length >= 2)
@@ -414,6 +509,7 @@ function App() {
       const count = (pred: (el: any) => boolean) => els.filter(pred).length;
       console.group("OSM Features Available:");
       console.log(`  buildings:      ${count((e) => !!e.tags?.building)}`);
+      console.log(`  indoor features:${indoorFeatures.length}`);
       console.log(`  roads/paths:    ${count((e) => !!e.tags?.highway)}`);
       console.log(`  bridges:        ${count((e) => !!e.tags?.highway && e.tags?.bridge === "yes")}`);
       console.log(`  railways:       ${count((e) => e.tags?.railway === "rail")}`);
@@ -435,12 +531,14 @@ function App() {
       setBuildings(blds);
       appendAreas(blds);
       setRoads(rdElems);
+      setIndoorFeatures(indoorFeatures);
       setParks(parsedParks);
       setWaterPolygons(parsedWaterPolygons);
       setRivers(riverElems);
       setStreams(streamElems);
       setForests(parsedForests);
       setRailways(railwayElems);
+      setIndoorDataStatus("loaded");
       setHasFetchedBuildings(true);
 
       clearInterval(progressIntervalRef.current!);
@@ -456,6 +554,7 @@ function App() {
       progressIntervalRef.current = null;
       const msg = error instanceof Error ? error.message : "Unknown error";
       setFetchError(`Failed to fetch map data: ${msg}. Please try again.`);
+      setIndoorDataStatus("error");
       setBuildProgress(0);
       setBuildStatus("");
       return false;
@@ -469,6 +568,11 @@ function App() {
     const ok = await requestBuildings();
     if (ok) setStep(2);
     else setStep(0);
+  };
+
+  const retryIndoorData = async () => {
+    const success = await requestBuildings();
+    if (success) setStep(2);
   };
 
   const handleClickNextStep = () => {
@@ -491,8 +595,14 @@ function App() {
   }, []);
 
   return (
-    <div css={css({ height: "100%", width: "100%" })}>
-      <TopNav step={step} />
+    <div css={css({ height: "100%", width: "100%", background: "#101a28" })}>
+      <TopNav
+        step={step}
+        inspectorOpen={inspectorOpen}
+        onMapClick={() => setStep(0)}
+        onInspectorToggle={() => setInspectorOpen((open) => !open)}
+        onSettingsClick={() => setIsExportModal(true)}
+      />
 
       <FullscreenModal isOpen={steps[step] == "front"}>
         <Column gap="1rem">
@@ -614,7 +724,7 @@ function App() {
         </Column>
       </FullscreenModal>
 
-      <PrevButton isShow={step !== 0 && !isFetchingBuildings} onClick={handleClickPrevStep}>
+      <PrevButton isShow={step !== 0 && step !== 2 && !isFetchingBuildings} onClick={handleClickPrevStep}>
         <ChevronLeft css={IconSize} /> Prev Step
       </PrevButton>
 
@@ -626,7 +736,11 @@ function App() {
         Generate <ChevronRight css={IconSize} />
       </NextButton>
 
-      <NextButton isShow={step == 2} onClick={handleClickExport}>
+      <NextButton
+        isShow={step == 2}
+        onClick={handleClickExport}
+        style={step === 2 ? { left: "1.25rem", right: "auto" } : undefined}
+      >
         Export GLB <Download css={IconSize} />
       </NextButton>
 
@@ -693,7 +807,15 @@ function App() {
         </Column>
       </Modal>
 
-      <Space></Space>
+      <Space
+        inspectorOpen={inspectorOpen}
+        onInspectorOpenChange={setInspectorOpen}
+        indoorDataStatus={indoorDataStatus}
+        indoorDataError={fetchError}
+        onIndoorDataRetry={retryIndoorData}
+        cameraView={cameraView}
+        onCameraViewChange={setCameraView}
+      />
     </div>
   );
 }

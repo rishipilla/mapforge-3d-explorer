@@ -1,0 +1,1100 @@
+import { useEffect, useRef, useMemo, useState } from "react";
+import { Canvas, useThree } from "@react-three/fiber";
+import { useAreaStore } from "@/state/areaStore";
+import { Html, Sky, Environment } from "@react-three/drei";
+import * as THREE from "three";
+import { useActionStore } from "@/state/exportStore";
+import { GLTFExporter } from "three/examples/jsm/Addons.js";
+import Car from "./Car";
+import instanceFleet from "@/api/axios";
+
+const ROAD_MAT = new THREE.MeshStandardMaterial({ color: "#3d3d3d" });
+const PATH_MAT = new THREE.MeshStandardMaterial({ color: "#888888" });
+const BUILDING_MAT = new THREE.MeshStandardMaterial({ color: "#9da0a3" });
+const BUILDING_ACTIVE_MAT = new THREE.MeshStandardMaterial({ color: "#007bff" });
+// Opaque ground material used in GLB export
+const GROUND_MAT = new THREE.MeshStandardMaterial({ color: "#888888", roughness: 1, metalness: 0 });
+// Ghost version shown in the browser preview — same colour, barely visible
+const GROUND_PREVIEW_MAT = new THREE.MeshStandardMaterial({ color: "#888888", roughness: 1, metalness: 0, transparent: true, opacity: 0.15, depthWrite: false });
+
+// ── New feature materials ──────────────────────────────────────────────────
+const PARK_MAT    = new THREE.MeshStandardMaterial({ color: "#4a7c59", roughness: 1, metalness: 0 });
+const WATER_MAT   = new THREE.MeshStandardMaterial({ color: "#2c5f7a", roughness: 0.3, metalness: 0 });
+const FOREST_MAT  = new THREE.MeshStandardMaterial({ color: "#2d5a27", roughness: 1, metalness: 0 });
+const RAILWAY_MAT = new THREE.MeshStandardMaterial({ color: "#2a2a2a", roughness: 1, metalness: 0 });
+const PILLAR_MAT  = new THREE.MeshStandardMaterial({ color: "#5a5a5a", roughness: 0.8, metalness: 0 });
+
+// ── Y offsets (scene units) ────────────────────────────────────────────────
+const BRIDGE_Y           =  3.0;
+const PARK_Y             = -0.02;
+const WATER_POLYGON_Y    = -0.05;
+const WATER_RIBBON_Y     = -0.04;
+const FOREST_Y           = -0.01;
+const RAILWAY_Y          =  0.02;
+
+// ── Polyline half-widths for new ribbon features ───────────────────────────
+const RIVER_HALF_WIDTH   = 4.0;
+const STREAM_HALF_WIDTH  = 1.0;
+const RAILWAY_HALF_WIDTH = 0.8;
+
+// ── Flat extrude settings (thin slab for ground-level polygons) ────────────
+const FLAT_EXTRUDE = { steps: 1, depth: 0.05, bevelEnabled: false } as const;
+
+function Building({
+  shape,
+  extrudeSettings,
+  tags,
+}: {
+  shape: THREE.Shape;
+  extrudeSettings: any;
+  tags: any;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const [clicked, setClicked] = useState(false);
+  const [hoverPos, setHoverPos] = useState<THREE.Vector3 | null>(null);
+  const [showTranslations, setShowTranslations] = useState(false);
+  const [showAdditionalInfo, setShowAdditionalInfo] = useState(false);
+  return (
+    <mesh
+      onPointerOver={(e) => {
+        setHovered(true);
+        e.stopPropagation();
+      }}
+      onPointerOut={(e) => {
+        setHovered(false);
+        e.stopPropagation();
+      }}
+      onPointerMove={(e) => {
+        setHoverPos(e.point.clone());
+        e.stopPropagation();
+      }}
+      onClick={(e) => {
+        setClicked(!clicked);
+        e.stopPropagation();
+      }}
+      rotation={[-Math.PI / 2, 0, 0]}
+      material={hovered || clicked ? BUILDING_ACTIVE_MAT : BUILDING_MAT}
+      userData={{ exportToGLB: true }}
+    >
+      <extrudeGeometry args={[shape, extrudeSettings]} />
+      {(hovered || clicked) && hoverPos && (
+        <Html position={[hoverPos.x, hoverPos.y + extrudeSettings.depth + 0.5, hoverPos.z]} center>
+          <div
+            role="dialog"
+            aria-label={tags.name || "Building Information"}
+            style={{
+              color: "#000000",
+              backgroundColor: "#ffffff96",
+              backdropFilter: "blur(8px)",
+              border: "none",
+              padding: "14px",
+              borderRadius: "10px",
+              fontFamily: "system-ui, -apple-system, sans-serif",
+              fontSize: "13px",
+              width: "200px",
+              boxShadow: "0 2px 14px rgba(0, 0, 0, 0.16)",
+              transition: "all 0.2s ease-in-out",
+            }}
+          >
+            <div
+              style={{
+                fontWeight: "600",
+                fontSize: "15px",
+                borderBottom: tags.name ? "1px solid rgba(0, 0, 0, 0.08)" : "none",
+                paddingBottom: tags.name ? "6px" : "0",
+                marginBottom: tags.name ? "8px" : "4px",
+              }}
+            >
+              {tags.name || "Building Information"}
+            </div>
+            {["building", "height", "building:levels", "amenity", "denomination"].map(
+              (key) =>
+                tags[key] &&
+                (key !== "building" || tags[key] !== "yes") && (
+                  <div
+                    key={key}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      margin: "4px 0",
+                    }}
+                  >
+                    <span style={{ fontWeight: "500", color: "#5f6368" }}>
+                      {key === "building"
+                        ? "Type"
+                        : key === "height"
+                        ? "Height"
+                        : key === "building:levels"
+                        ? "Levels"
+                        : key === "amenity"
+                        ? "Facility"
+                        : key === "denomination"
+                        ? "Denomination"
+                        : key.replace(/_/g, " ")}
+                      :
+                    </span>
+                    <span style={{ textTransform: "capitalize" }}>
+                      {key === "height" ? `${tags[key]} m` : tags[key]}
+                    </span>
+                  </div>
+                )
+            )}
+            {[
+              "addr:street",
+              "addr:housenumber",
+              "addr:district",
+              "addr:city",
+              "addr:postcode",
+            ].some((key) => tags[key]) && (
+              <div
+                style={{
+                  margin: "10px 0 8px",
+                  borderTop: "1px solid rgba(0, 0, 0, 0.08)",
+                  paddingTop: "8px",
+                }}
+              >
+                <div style={{ fontWeight: "500", marginBottom: "4px", color: "#5f6368" }}>
+                  Address
+                </div>
+                <div style={{ marginLeft: "4px", fontSize: "12px", color: "#5f6368" }}>
+                  {[
+                    [tags["addr:street"], tags["addr:housenumber"]].filter(Boolean).join(" "),
+                    tags["addr:district"],
+                    tags["addr:city"],
+                    tags["addr:postcode"],
+                  ]
+                    .filter(Boolean)
+                    .join(", ")}
+                </div>
+              </div>
+            )}
+            {Object.entries(tags).filter(
+              ([key]) =>
+                ![
+                  "building",
+                  "name",
+                  "height",
+                  "building:levels",
+                  "source",
+                  "amenity",
+                  "denomination",
+                ].includes(key) &&
+                !key.startsWith("addr:") &&
+                !key.startsWith("name:") &&
+                !key.startsWith("alt_name:")
+            ).length > 0 && (
+              <div
+                style={{
+                  margin: "10px 0 4px",
+                  borderTop: "1px solid rgba(0, 0, 0, 0.08)",
+                  paddingTop: "8px",
+                }}
+              >
+                <div
+                  style={{
+                    fontWeight: "500",
+                    marginBottom: "4px",
+                    color: "#5f6368",
+                    cursor: "pointer",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                  }}
+                  onClick={() => setShowAdditionalInfo(!showAdditionalInfo)}
+                >
+                  Additional Information
+                  <span>{showAdditionalInfo ? "▲" : "▼"}</span>
+                </div>
+                {showAdditionalInfo && (
+                  <div>
+                    {Object.entries(tags)
+                      .filter(
+                        ([key]) =>
+                          ![
+                            "building",
+                            "name",
+                            "height",
+                            "building:levels",
+                            "source",
+                            "amenity",
+                            "denomination",
+                          ].includes(key) &&
+                          !key.startsWith("addr:") &&
+                          !key.startsWith("name:") &&
+                          !key.startsWith("alt_name:")
+                      )
+                      .map(([key, value]) => {
+                        if (
+                          key === "description" ||
+                          (typeof value === "string" && value.length > 80)
+                        ) {
+                          return (
+                            <div key={key} style={{ margin: "8px 0" }}>
+                              <div
+                                style={{ fontWeight: "500", color: "#5f6368", marginBottom: "4px" }}
+                              >
+                                {key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " ")}
+                              </div>
+                              <div
+                                style={{
+                                  textAlign: "left",
+                                  fontSize: "12px",
+                                  color: "#5f6368",
+                                  fontWeight: "400",
+                                  textWrap: "wrap",
+                                  whiteSpace: "pre-wrap",
+                                  lineHeight: "1.4",
+                                  backgroundColor: "rgba(0,0,0,0.02)",
+                                  padding: "6px 8px",
+                                  borderRadius: "4px",
+                                }}
+                              >
+                                {String(value)}
+                              </div>
+                            </div>
+                          );
+                        }
+                        return (
+                          <div
+                            key={key}
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              margin: "4px 0",
+                            }}
+                          >
+                            <span
+                              style={{
+                                fontWeight: "700",
+                                color: "#5f6368",
+                                textAlign: "left",
+                              }}
+                            >
+                              {key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " ")}:
+                            </span>
+                            <span
+                              style={{
+                                textTransform: "capitalize",
+                                fontWeight: "400",
+                                textAlign: "right",
+                              }}
+                            >
+                              {String(value)}
+                            </span>
+                          </div>
+                        );
+                      })}
+                  </div>
+                )}
+              </div>
+            )}
+            {Object.entries(tags).filter(([key]) => key.startsWith("name:")).length > 0 && (
+              <div
+                style={{
+                  margin: "10px 0 4px",
+                  borderTop: "1px solid rgba(0, 0, 0, 0.08)",
+                  paddingTop: "8px",
+                  textAlign: "right",
+                }}
+              >
+                <div
+                  style={{
+                    fontWeight: "500",
+                    marginBottom: "4px",
+                    color: "#5f6368",
+                    cursor: "pointer",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                  }}
+                  onClick={() => setShowTranslations(!showTranslations)}
+                >
+                  Name Translations
+                  <span>{showTranslations ? "▲" : "▼"}</span>
+                </div>
+                {showTranslations && (
+                  <div>
+                    {Object.entries(tags)
+                      .filter(([key]) => key.startsWith("name:"))
+                      .map(([key, value]) => (
+                        <div
+                          key={key}
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            margin: "4px 0",
+                          }}
+                        >
+                          <span style={{ fontWeight: "500", color: "#5f6368" }}>
+                            {key.replace("name:", "").toUpperCase()}:
+                          </span>
+                          <span style={{ textTransform: "capitalize" }}>{String(value)}</span>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </Html>
+      )}
+    </mesh>
+  );
+}
+
+// Highway types rendered as pedestrian paths (lighter material, narrower).
+const PEDESTRIAN_TYPES = new Set([
+  "footway", "path", "steps", "pedestrian", "track", "cycleway",
+]);
+
+// Half-widths in scene units (1 unit ≈ 2 m at mid-latitudes).
+// Keyed by OSM highway tag value.
+const ROAD_HALF_WIDTH: Record<string, number> = {
+  motorway: 4.5,
+  motorway_link: 2.5,
+  trunk: 3.5,
+  trunk_link: 2.0,
+  primary: 3.0,
+  primary_link: 2.0,
+  secondary: 2.5,
+  secondary_link: 1.8,
+  tertiary: 2.0,
+  tertiary_link: 1.5,
+  residential: 1.8,
+  living_street: 1.6,
+  unclassified: 1.8,
+  service: 1.2,
+  // Pedestrian / non-vehicle — narrow
+  pedestrian: 0.5,
+  footway: 0.4,
+  cycleway: 0.4,
+  path: 0.35,
+  track: 0.45,
+  steps: 0.3,
+};
+const DEFAULT_ROAD_HALF_WIDTH = 1.5;
+
+// Build a flat ribbon THREE.Shape from a projected 2-D polyline.
+// Returns null if the polyline is degenerate.
+function buildRoadShape(pts: THREE.Vector2[], halfW: number): THREE.Shape | null {
+  const left: THREE.Vector2[] = [];
+  const right: THREE.Vector2[] = [];
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-6) continue;
+    // Perpendicular unit vector (90° CCW)
+    const nx = (-dy / len) * halfW;
+    const ny = (dx / len) * halfW;
+
+    if (left.length === 0) {
+      left.push(new THREE.Vector2(a.x + nx, a.y + ny));
+      right.push(new THREE.Vector2(a.x - nx, a.y - ny));
+    }
+    left.push(new THREE.Vector2(b.x + nx, b.y + ny));
+    right.push(new THREE.Vector2(b.x - nx, b.y - ny));
+  }
+
+  if (left.length < 2) return null;
+
+  const shape = new THREE.Shape();
+  shape.moveTo(left[0].x, left[0].y);
+  for (let i = 1; i < left.length; i++) shape.lineTo(left[i].x, left[i].y);
+  for (let i = right.length - 1; i >= 0; i--) shape.lineTo(right[i].x, right[i].y);
+  shape.closePath();
+  return shape;
+}
+
+const ROAD_EXTRUDE = { steps: 1, depth: 0.1, bevelEnabled: false } as const;
+
+// ── Polygon ring → THREE.Shape ─────────────────────────────────────────────
+
+import type { PolygonRing, PolylineElem } from "@/state/areaStore";
+
+type BBox = { minLat: number; maxLat: number; minLng: number; maxLng: number };
+
+/**
+ * Sutherland-Hodgman polygon clip against an axis-aligned lat/lon bbox.
+ * Clips the ring against each of the 4 half-planes in turn.
+ * Returns null if the clipped result has fewer than 3 vertices.
+ */
+function clipPolygonRingToBbox(
+  ring: Array<{ lat: number; lon: number }>,
+  minLat: number, maxLat: number,
+  minLng: number, maxLng: number
+): Array<{ lat: number; lon: number }> | null {
+  const lerp = (
+    a: { lat: number; lon: number },
+    b: { lat: number; lon: number },
+    t: number
+  ) => ({ lat: a.lat + t * (b.lat - a.lat), lon: a.lon + t * (b.lon - a.lon) });
+
+  type Plane = {
+    inside: (p: { lat: number; lon: number }) => boolean;
+    intersect: (a: { lat: number; lon: number }, b: { lat: number; lon: number }) => { lat: number; lon: number };
+  };
+
+  const planes: Plane[] = [
+    // left: lon >= minLng
+    { inside: (p) => p.lon >= minLng, intersect: (a, b) => lerp(a, b, (minLng - a.lon) / (b.lon - a.lon)) },
+    // right: lon <= maxLng
+    { inside: (p) => p.lon <= maxLng, intersect: (a, b) => lerp(a, b, (maxLng - a.lon) / (b.lon - a.lon)) },
+    // bottom: lat >= minLat
+    { inside: (p) => p.lat >= minLat, intersect: (a, b) => lerp(a, b, (minLat - a.lat) / (b.lat - a.lat)) },
+    // top: lat <= maxLat
+    { inside: (p) => p.lat <= maxLat, intersect: (a, b) => lerp(a, b, (maxLat - a.lat) / (b.lat - a.lat)) },
+  ];
+
+  // Remove closing duplicate point if present before processing.
+  let poly = ring.slice();
+  if (poly.length > 1) {
+    const first = poly[0];
+    const last = poly[poly.length - 1];
+    if (Math.abs(first.lat - last.lat) < 1e-10 && Math.abs(first.lon - last.lon) < 1e-10) {
+      poly = poly.slice(0, -1);
+    }
+  }
+
+  for (const plane of planes) {
+    if (poly.length === 0) return null;
+    const input = poly;
+    poly = [];
+    for (let i = 0; i < input.length; i++) {
+      const a = input[i];
+      const b = input[(i + 1) % input.length];
+      const aIn = plane.inside(a);
+      const bIn = plane.inside(b);
+      if (aIn) {
+        poly.push(a);
+        if (!bIn) poly.push(plane.intersect(a, b));
+      } else if (bIn) {
+        poly.push(plane.intersect(a, b));
+      }
+    }
+  }
+
+  return poly.length >= 3 ? poly : null;
+}
+
+/**
+ * Signed area of a 2-D polygon using the shoelace formula.
+ * Result > 0 → counter-clockwise (CCW).
+ * Result < 0 → clockwise (CW).
+ * The array must NOT contain a closing duplicate — wrap-around is handled via modulo.
+ */
+function signedArea2D(pts: THREE.Vector2[]): number {
+  const n = pts.length;
+  let area = 0;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % n];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return area * 0.5;
+}
+
+/**
+ * Projects a polygon ring into a THREE.Shape, applying bbox clipping and
+ * winding-order correction as needed.
+ *
+ * Strategy (AABB-based, no arbitrary thresholds):
+ *  1. Compute the ring's AABB in lat/lon space.
+ *  2. AABB doesn't intersect scene bbox → skip (completely outside).
+ *  3. AABB fully inside scene bbox → project as-is (no clipping needed).
+ *  4. AABB partially overlaps → clip with Sutherland-Hodgman, then project.
+ *
+ * After projection, the winding order is normalised to CCW using the shoelace
+ * formula. THREE.ShapeGeometry requires CCW outer rings; a CW ring is treated
+ * as a hole and triangulates to just edge slivers.
+ *
+ * Returns null to indicate "skip this ring".
+ */
+function buildPolygonShapeClipped(
+  ring: PolygonRing["ring"],
+  refLat: number,
+  refLng: number,
+  scaleX: number,
+  scaleY: number,
+  bbox: BBox
+): THREE.Shape | null {
+  if (ring.length < 3) return null;
+
+  const { minLat, maxLat, minLng, maxLng } = bbox;
+
+  // Compute the ring's AABB in lat/lon space.
+  let rMinLat = Infinity, rMaxLat = -Infinity;
+  let rMinLng = Infinity, rMaxLng = -Infinity;
+  for (const pt of ring) {
+    if (pt.lat < rMinLat) rMinLat = pt.lat;
+    if (pt.lat > rMaxLat) rMaxLat = pt.lat;
+    if (pt.lon < rMinLng) rMinLng = pt.lon;
+    if (pt.lon > rMaxLng) rMaxLng = pt.lon;
+  }
+
+  // 2. No overlap at all → skip.
+  const aabbOverlaps =
+    rMaxLng >= minLng && rMinLng <= maxLng &&
+    rMaxLat >= minLat && rMinLat <= maxLat;
+  if (!aabbOverlaps) return null;
+
+  // 3/4. Fully inside → project as-is; partially outside → clip first.
+  const fullyInside =
+    rMinLat >= minLat && rMaxLat <= maxLat &&
+    rMinLng >= minLng && rMaxLng <= maxLng;
+
+  let workingRing: typeof ring;
+  if (fullyInside) {
+    workingRing = ring;
+  } else {
+    const clipped = clipPolygonRingToBbox(ring, minLat, maxLat, minLng, maxLng);
+    if (!clipped || clipped.length < 3) return null;
+    workingRing = clipped;
+  }
+
+  // Project to scene coordinates.
+  const pts = workingRing.map((pt) => new THREE.Vector2(
+    (pt.lon - refLng) * scaleX,
+    (pt.lat - refLat) * scaleY,
+  ));
+
+  // Strip any closing duplicate before the winding check so modulo wrap-around
+  // is correct (the shoelace formula must not double-count the closing edge).
+  if (pts.length > 1 && pts[0].distanceTo(pts[pts.length - 1]) < 1e-6) {
+    pts.pop();
+  }
+  if (pts.length < 3) return null;
+
+  // Normalise to CCW: THREE.ShapeGeometry triangulates CCW rings as filled
+  // faces; a CW outer ring is treated as a hole and produces only edge slivers.
+  if (signedArea2D(pts) < 0) pts.reverse();
+
+  // Re-close the path for THREE.Shape.
+  pts.push(pts[0].clone());
+  return new THREE.Shape(pts);
+}
+
+// ── Polyline clipping ─────────────────────────────────────────────────────────
+
+/**
+ * Liang-Barsky parametric segment clip against an axis-aligned rectangle.
+ * Works in any 2-D coordinate system (lat/lon here).
+ * Returns [x0,y0, x1,y1] of the clipped segment, or null if fully outside.
+ */
+function clipSegment(
+  x0: number, y0: number,
+  x1: number, y1: number,
+  xmin: number, ymin: number,
+  xmax: number, ymax: number
+): [number, number, number, number] | null {
+  let t0 = 0, t1 = 1;
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;        // parallel edge — outside if q < 0
+    const r = q / p;
+    if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; }
+    else       { if (r < t0) return false; if (r < t1) t1 = r; }
+    return true;
+  };
+
+  if (
+    !clip(-dx, x0 - xmin) ||
+    !clip( dx, xmax - x0) ||
+    !clip(-dy, y0 - ymin) ||
+    !clip( dy, ymax - y0)
+  ) return null;
+
+  return [x0 + t0 * dx, y0 + t0 * dy, x0 + t1 * dx, y0 + t1 * dy];
+}
+
+type LatLon = { lat: number; lon: number };
+
+/**
+ * Clips a lat/lon polyline to the given bounding box.
+ * Returns one or more contiguous sub-polylines (a road crossing a bbox corner
+ * may produce two separate segments).
+ */
+function clipPolylineToBbox(
+  pts: LatLon[],
+  minLat: number, maxLat: number,
+  minLng: number, maxLng: number
+): LatLon[][] {
+  const result: LatLon[][] = [];
+  let current: LatLon[] = [];
+
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i];
+    const p1 = pts[i + 1];
+    const seg = clipSegment(
+      p0.lon, p0.lat, p1.lon, p1.lat,
+      minLng, minLat, maxLng, maxLat
+    );
+    if (!seg) {
+      if (current.length >= 2) result.push(current);
+      current = [];
+      continue;
+    }
+    const [x0, y0, x1, y1] = seg;
+    const cp0: LatLon = { lat: y0, lon: x0 };
+    const cp1: LatLon = { lat: y1, lon: x1 };
+
+    if (current.length === 0) {
+      current.push(cp0, cp1);
+    } else {
+      const last = current[current.length - 1];
+      // If the clipped start equals the last accumulated point, extend;
+      // otherwise the segment was clipped at entry — start a new chain.
+      if (Math.abs(last.lat - cp0.lat) < 1e-10 && Math.abs(last.lon - cp0.lon) < 1e-10) {
+        current.push(cp1);
+      } else {
+        result.push(current);
+        current = [cp0, cp1];
+      }
+    }
+  }
+  if (current.length >= 2) result.push(current);
+  return result;
+}
+
+function RoadMesh({
+  shape,
+  material,
+  yPos = 0,
+}: {
+  shape: THREE.Shape;
+  material: THREE.MeshStandardMaterial;
+  yPos?: number;
+}) {
+  const meshRef = useRef<THREE.Mesh>(null!);
+  useEffect(() => {
+    meshRef.current.userData.exportToGLB = true;
+  }, []);
+  return (
+    <mesh ref={meshRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, yPos, 0]} material={material}>
+      <extrudeGeometry args={[shape, ROAD_EXTRUDE]} />
+    </mesh>
+  );
+}
+
+// ── Bridge support pillar ──────────────────────────────────────────────────
+
+function BridgePillar({ cx, cz }: { cx: number; cz: number }) {
+  const meshRef = useRef<THREE.Mesh>(null!);
+  useEffect(() => {
+    meshRef.current.userData.exportToGLB = true;
+  }, []);
+  // Pillar spans from y=0 to y=BRIDGE_Y; positioned at centroid of road ribbon.
+  return (
+    <mesh
+      ref={meshRef}
+      position={[cx, BRIDGE_Y / 2, cz]}
+      material={PILLAR_MAT}
+    >
+      <boxGeometry args={[0.6, BRIDGE_Y, 0.6]} />
+    </mesh>
+  );
+}
+
+// ── Flat polygon mesh (parks, water, forests) ──────────────────────────────
+
+function FlatPolygonMesh({
+  shape,
+  material,
+  yPos,
+}: {
+  shape: THREE.Shape;
+  material: THREE.MeshStandardMaterial;
+  yPos: number;
+}) {
+  const meshRef = useRef<THREE.Mesh>(null!);
+  useEffect(() => {
+    meshRef.current.userData.exportToGLB = true;
+  }, []);
+  return (
+    <mesh ref={meshRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, yPos, 0]} material={material}>
+      <extrudeGeometry args={[shape, FLAT_EXTRUDE]} />
+    </mesh>
+  );
+}
+
+function RoadMeshes() {
+  const roads = useAreaStore((state) => state.roads);
+  const projection = useAreaStore((state) => state.projection);
+
+  const roadItems = useMemo(() => {
+    if (!projection) return [];
+    const { refLat, refLng, scaleX, scaleY, bbox } = projection;
+    return roads.flatMap((road, i) => {
+      if (!road.geometry || road.geometry.length < 2) return [];
+      const highwayType: string = road.tags?.highway ?? "";
+      const halfW = ROAD_HALF_WIDTH[highwayType] ?? DEFAULT_ROAD_HALF_WIDTH;
+      const material = PEDESTRIAN_TYPES.has(highwayType) ? PATH_MAT : ROAD_MAT;
+      const isBridge = road.tags?.bridge === "yes";
+      const yPos = isBridge ? BRIDGE_Y : 0;
+
+      const clippedChains = clipPolylineToBbox(
+        road.geometry as LatLon[],
+        bbox.minLat, bbox.maxLat, bbox.minLng, bbox.maxLng
+      );
+
+      return clippedChains.flatMap((chain, ci) => {
+        const pts2d = chain.map((pt) => new THREE.Vector2(
+          (pt.lon - refLng) * scaleX,
+          (pt.lat - refLat) * scaleY,
+        ));
+        const shape = buildRoadShape(pts2d, halfW);
+        if (!shape) return [];
+
+        // Pillar centroid: average of 2-D ribbon points.
+        // In the mesh's local frame (rotated -90° around X), the scene-space
+        // X maps to pts2d.x and scene-space Z maps to -pts2d.y.
+        const cx = pts2d.reduce((s, p) => s + p.x, 0) / pts2d.length;
+        const cz = -(pts2d.reduce((s, p) => s + p.y, 0) / pts2d.length);
+
+        return [{ shape, material, yPos, isBridge, cx, cz, key: `${road.id ?? i}-${ci}` }];
+      });
+    });
+  }, [roads, projection]);
+
+  return (
+    <>
+      {roadItems.map(({ shape, material, yPos, isBridge, cx, cz, key }) => (
+        <group key={key}>
+          <RoadMesh shape={shape} material={material} yPos={yPos} />
+          {isBridge && <BridgePillar cx={cx} cz={cz} />}
+        </group>
+      ))}
+    </>
+  );
+}
+
+// ── Parks + grass ──────────────────────────────────────────────────────────
+
+function GreenMeshes() {
+  const parks = useAreaStore((state) => state.parks);
+  const projection = useAreaStore((state) => state.projection);
+
+  const shapes = useMemo(() => {
+    if (!projection) return [];
+    const { refLat, refLng, scaleX, scaleY, bbox } = projection;
+    return parks.flatMap(({ key, ring }) => {
+      const shape = buildPolygonShapeClipped(ring, refLat, refLng, scaleX, scaleY, bbox);
+      if (!shape) return [];
+      return [{ shape, key }];
+    });
+  }, [parks, projection]);
+
+  return (
+    <>
+      {shapes.map(({ shape, key }) => (
+        <FlatPolygonMesh key={key} shape={shape} material={PARK_MAT} yPos={PARK_Y} />
+      ))}
+    </>
+  );
+}
+
+// ── Water polygons ─────────────────────────────────────────────────────────
+
+function WaterPolygonMeshes() {
+  const waterPolygons = useAreaStore((state) => state.waterPolygons);
+  const projection = useAreaStore((state) => state.projection);
+
+  const shapes = useMemo(() => {
+    if (!projection) return [];
+    const { refLat, refLng, scaleX, scaleY, bbox } = projection;
+    return waterPolygons.flatMap(({ key, ring }) => {
+      const shape = buildPolygonShapeClipped(ring, refLat, refLng, scaleX, scaleY, bbox);
+      if (!shape) return [];
+      return [{ shape, key }];
+    });
+  }, [waterPolygons, projection]);
+
+  return (
+    <>
+      {shapes.map(({ shape, key }) => (
+        <FlatPolygonMesh key={key} shape={shape} material={WATER_MAT} yPos={WATER_POLYGON_Y} />
+      ))}
+    </>
+  );
+}
+
+// ── Rivers + streams (ribbon mesh) ────────────────────────────────────────
+
+function WaterRibbonMeshes() {
+  const rivers = useAreaStore((state) => state.rivers);
+  const streams = useAreaStore((state) => state.streams);
+  const projection = useAreaStore((state) => state.projection);
+
+  const shapes = useMemo(() => {
+    if (!projection) return [];
+    const { refLat, refLng, scaleX, scaleY, bbox } = projection;
+
+    const process = (elems: PolylineElem[], halfW: number) =>
+      elems.flatMap((el, i) => {
+        const clipped = clipPolylineToBbox(
+          el.geometry as LatLon[],
+          bbox.minLat, bbox.maxLat, bbox.minLng, bbox.maxLng
+        );
+        return clipped.flatMap((chain, ci) => {
+          const pts2d = chain.map((pt) => new THREE.Vector2(
+            (pt.lon - refLng) * scaleX,
+            (pt.lat - refLat) * scaleY,
+          ));
+          const shape = buildRoadShape(pts2d, halfW);
+          if (!shape) return [];
+          return [{ shape, key: `${el.id ?? i}-${ci}` }];
+        });
+      });
+
+    return [
+      ...process(rivers, RIVER_HALF_WIDTH),
+      ...process(streams, STREAM_HALF_WIDTH),
+    ];
+  }, [rivers, streams, projection]);
+
+  return (
+    <>
+      {shapes.map(({ shape, key }) => (
+        <RoadMesh key={key} shape={shape} material={WATER_MAT} yPos={WATER_RIBBON_Y} />
+      ))}
+    </>
+  );
+}
+
+// ── Forests ────────────────────────────────────────────────────────────────
+
+function ForestMeshes() {
+  const forests = useAreaStore((state) => state.forests);
+  const projection = useAreaStore((state) => state.projection);
+
+  const shapes = useMemo(() => {
+    if (!projection) return [];
+    const { refLat, refLng, scaleX, scaleY, bbox } = projection;
+    return forests.flatMap(({ key, ring }) => {
+      const shape = buildPolygonShapeClipped(ring, refLat, refLng, scaleX, scaleY, bbox);
+      if (!shape) return [];
+      return [{ shape, key }];
+    });
+  }, [forests, projection]);
+
+  return (
+    <>
+      {shapes.map(({ shape, key }) => (
+        <FlatPolygonMesh key={key} shape={shape} material={FOREST_MAT} yPos={FOREST_Y} />
+      ))}
+    </>
+  );
+}
+
+// ── Railways ───────────────────────────────────────────────────────────────
+
+function RailwayMeshes() {
+  const railways = useAreaStore((state) => state.railways);
+  const projection = useAreaStore((state) => state.projection);
+
+  const shapes = useMemo(() => {
+    if (!projection) return [];
+    const { refLat, refLng, scaleX, scaleY, bbox } = projection;
+    return railways.flatMap((el, i) => {
+      const clipped = clipPolylineToBbox(
+        el.geometry as LatLon[],
+        bbox.minLat, bbox.maxLat, bbox.minLng, bbox.maxLng
+      );
+      return clipped.flatMap((chain, ci) => {
+        const pts2d = chain.map((pt) => new THREE.Vector2(
+          (pt.lon - refLng) * scaleX,
+          (pt.lat - refLat) * scaleY,
+        ));
+        const shape = buildRoadShape(pts2d, RAILWAY_HALF_WIDTH);
+        if (!shape) return [];
+        return [{ shape, key: `rail-${el.id ?? i}-${ci}` }];
+      });
+    });
+  }, [railways, projection]);
+
+  return (
+    <>
+      {shapes.map(({ shape, key }) => (
+        <RoadMesh key={key} shape={shape} material={RAILWAY_MAT} yPos={RAILWAY_Y} />
+      ))}
+    </>
+  );
+}
+
+// Stable position — module-level constant so R3F never sees a new array reference.
+const GROUND_POSITION: [number, number, number] = [0, -0.25, 0];
+
+// sceneWidth / sceneDepth are computed in Space via useMemo(…, [center]) so they
+// only change when the user generates a new scene, never on canvas resize.
+function GroundPlane({ sceneWidth, sceneDepth }: { sceneWidth: number; sceneDepth: number }) {
+  const meshRef = useRef<THREE.Mesh>(null!);
+  const includeGroundPlane = useActionStore((state) => state.includeGroundPlane);
+
+  // Stable args tuple — only a new array when dimensions actually change.
+  const boxArgs = useMemo<[number, number, number]>(
+    () => [sceneWidth, 0.5, sceneDepth],
+    [sceneWidth, sceneDepth]
+  );
+
+  useEffect(() => {
+    if (!meshRef.current) return;
+    meshRef.current.userData.exportToGLB = true;
+    meshRef.current.userData.groundPlane = true;
+  }, []);
+
+  if (!includeGroundPlane) return null;
+
+  // Top face sits at y = 0, flush with building bases.
+  // X = longitudinal span, Z = latitudinal span (world Z after building rotation).
+  return (
+    <mesh ref={meshRef} position={GROUND_POSITION} material={GROUND_PREVIEW_MAT}>
+      <boxGeometry args={boxArgs} />
+    </mesh>
+  );
+}
+
+export function Export() {
+  const { scene } = useThree();
+  const action = useActionStore((state) => state.action);
+  const fleetSpaceId = useActionStore((state) => state.fleetSpaceId);
+
+  const exportType = useActionStore((state) => state.exportType);
+
+  const setAction = useActionStore((state) => state.setAction);
+
+  useEffect(() => {
+    if (action === true) {
+      setAction(false);
+      exportGLB();
+    }
+  }, [action, setAction, scene]);
+
+  const uploadFleet = async (blob) => {
+    const formData = new FormData();
+
+    formData.append("object", blob, "box3d.glb");
+    formData.append("title", "New Object");
+    formData.append("description", "");
+    formData.append("spaceId", fleetSpaceId);
+
+    await instanceFleet.post("space/file/mesh", formData, {
+      headers: {
+        "Content-Type": "multipart/form-data",
+      },
+    });
+  };
+
+  const exportGLB = () => {
+    const exportRoot = new THREE.Group();
+    scene.traverse((child) => {
+      if (child.userData?.exportToGLB === true) {
+        const clone = child.clone(true);
+        // Swap preview material → opaque export material on the ground plane
+        if (child.userData?.groundPlane === true && clone instanceof THREE.Mesh) {
+          clone.material = GROUND_MAT;
+        }
+        exportRoot.add(clone);
+      }
+    });
+    const exporter = new GLTFExporter();
+    const options = { binary: true, embedImages: true };
+    exporter.parse(
+      exportRoot,
+      (result) => {
+        if (result instanceof ArrayBuffer) {
+          const blob = new Blob([result], { type: "model/gltf-binary" });
+
+          if (exportType == "glb") {
+            const link = document.createElement("a");
+            link.style.display = "none";
+            document.body.appendChild(link);
+            link.href = URL.createObjectURL(blob);
+            link.download = "scene.glb";
+            link.click();
+            document.body.removeChild(link);
+          }
+
+          if (exportType == "fleet") {
+            uploadFleet(blob);
+          }
+        } else {
+          console.error("GLB export failed: unexpected result", result);
+        }
+      },
+      (error) => {
+        console.error("An error occurred during export", error);
+      },
+      options
+    );
+  };
+  return null;
+}
+
+export function Space() {
+  const areas = useAreaStore((state) => state.areas);
+  const projection = useAreaStore((state) => state.projection);
+
+  // Ground plane dimensions — frozen at generation time via projection store.
+  // Never recalculates on canvas/viewport resize.
+  const { groundSceneWidth, groundSceneDepth } = useMemo(() => {
+    if (!projection) return { groundSceneWidth: 0, groundSceneDepth: 0 };
+    const { bbox, scaleX, scaleY } = projection;
+    return {
+      groundSceneWidth: (bbox.maxLng - bbox.minLng) * scaleX * 1.2,
+      groundSceneDepth: (bbox.maxLat - bbox.minLat) * scaleY * 1.2,
+    };
+  }, [projection]);
+
+  const buildingsData = useMemo(() => {
+    if (!projection) return [];
+    const { refLat, refLng, scaleX, scaleY } = projection;
+    const result: Array<{ shape: THREE.Shape; extrudeSettings: any; tags: any }> = [];
+    areas.forEach((bld: any) => {
+      if (!bld.geometry || bld.geometry.length < 3) return;
+      const shapePoints = bld.geometry.map((pt: any) =>
+        new THREE.Vector2((pt.lng - refLng) * scaleX, (pt.lat - refLat) * scaleY)
+      );
+      if (!shapePoints[0].equals(shapePoints[shapePoints.length - 1]))
+        shapePoints.push(shapePoints[0]);
+      const shape = new THREE.Shape(shapePoints);
+      let heightValue = parseFloat(bld.tags.height || "");
+      const heightLevels = parseFloat(bld.tags["building:levels"] || "");
+      if (isNaN(heightValue)) heightValue = 10;
+      if (!isNaN(heightLevels)) heightValue = heightLevels * 2.2;
+      result.push({ shape, extrudeSettings: { steps: 1, depth: heightValue, bevelEnabled: false }, tags: bld.tags });
+    });
+    return result;
+  }, [areas, projection]);
+
+  return (
+    <Canvas camera={{ fov: 90, near: 0.1, far: 7000 }}>
+      <ambientLight intensity={Math.PI / 2} />
+      <spotLight position={[10, 10, 10]} angle={0.15} penumbra={1} decay={0} intensity={Math.PI} />
+      <GroundPlane sceneWidth={groundSceneWidth} sceneDepth={groundSceneDepth} />
+      <GreenMeshes />
+      <WaterPolygonMeshes />
+      <ForestMeshes />
+      <WaterRibbonMeshes />
+      <RailwayMeshes />
+      <RoadMeshes />
+      {buildingsData.map((item, index) => (
+        <Building
+          key={index}
+          shape={item.shape}
+          extrudeSettings={item.extrudeSettings}
+          tags={item.tags}
+        />
+      ))}
+      <pointLight position={[-10, -10, -10]} decay={0} intensity={Math.PI} />
+      <Car />
+      <Export />
+      <Sky distance={450000} sunPosition={[0, 1, 0]} inclination={0} azimuth={0.25} />
+      <Environment preset="city" />
+    </Canvas>
+  );
+}

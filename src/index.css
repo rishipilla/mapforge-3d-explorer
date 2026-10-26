@@ -28,3 +28,53 @@ body,
     "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", "Apple Color Emoji",
     "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
 }
+
+.mapforge-scene {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  background: #172437;
+}
+
+.mapforge-scene canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.building-inspector-panel {
+  position: absolute;
+  top: 76px;
+  right: 20px;
+  bottom: 58px;
+  width: min(360px, calc(100vw - 40px));
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #94a3b8 transparent;
+}
+
+.building-inspector-panel::-webkit-scrollbar {
+  display: block;
+  width: 6px;
+}
+
+.building-inspector-panel::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 6px;
+}
+
+@media (max-width: 640px) {
+  .building-inspector-panel {
+    top: auto;
+    right: 10px;
+    bottom: 12px;
+    left: 10px;
+    width: auto;
+    max-height: min(52vh, 430px);
+    padding: 14px !important;
+    border-radius: 10px !important;
+  }
+}

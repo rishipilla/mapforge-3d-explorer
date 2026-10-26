@@ -10,6 +10,7 @@ interface ButtonProps
 }
 
 export function NextButton(props: ButtonProps) {
+  const { isShow, ...buttonProps } = props;
   return (
     <button
       css={css({
@@ -17,29 +18,28 @@ export function NextButton(props: ButtonProps) {
         zIndex: 9999,
         right: "2rem",
         bottom: "2rem",
-        color: "#000000",
-        backgroundColor: "#ffffff96",
-        backdropFilter: "blur(8px)",
-        border: "none",
+        color: "#f8fafc",
+        backgroundColor: "#1268d3",
+        border: "1px solid #3984df",
         padding: "0.75rem 1.25rem",
         borderRadius: "8px",
         fontWeight: "300",
         fontSize: "14px",
-        outline: "rgba(240, 240, 244, 0.51) solid 0.1rem",
+        boxShadow: "0 8px 24px rgba(2, 8, 23, 0.26)",
         cursor: "pointer",
         transition: "0.2s",
-        display: props.isShow ? "flex" : "none",
+        display: isShow ? "flex" : "none",
         alignItems: "center",
         gap: "0.5rem",
         ":hover": {
-          backgroundColor: "#ebeef0c2",
+          backgroundColor: "#0f2745",
         },
         ":disabled": {
-          backgroundColor: "#ebeef0c2",
+          backgroundColor: "#334155",
           cursor: "not-allowed",
         },
       })}
-      {...props}
+      {...buttonProps}
     >
       {props.children}
     </button>
@@ -47,6 +47,7 @@ export function NextButton(props: ButtonProps) {
 }
 
 export function PrevButton(props: ButtonProps) {
+  const { isShow, ...buttonProps } = props;
   return (
     <button
       css={css({
@@ -54,29 +55,27 @@ export function PrevButton(props: ButtonProps) {
         zIndex: 9999,
         left: "2rem",
         bottom: "2rem",
-        color: "#000000",
-        backgroundColor: "#ffffff96",
-        backdropFilter: "blur(8px)",
-        border: "none",
+        color: "#e2e8f0",
+        backgroundColor: "#172437",
+        border: "1px solid #334155",
         padding: "0.75rem 1.25rem",
         borderRadius: "8px",
         fontWeight: "300",
         fontSize: "14px",
-        outline: "rgba(240, 240, 244, 0.51) solid 0.1rem",
         cursor: "pointer",
         transition: "0.2s",
-        display: props.isShow ? "flex" : "none",
+        display: isShow ? "flex" : "none",
         alignItems: "center",
         gap: "0.5rem",
         ":hover": {
-          backgroundColor: "#ebeef0c2",
+          backgroundColor: "#243449",
         },
         ":disabled": {
-          backgroundColor: "#ebeef0c2",
+          backgroundColor: "#334155",
           cursor: "not-allowed",
         },
       })}
-      {...props}
+      {...buttonProps}
     >
       {props.children}
     </button>
@@ -84,22 +83,21 @@ export function PrevButton(props: ButtonProps) {
 }
 
 export function Button(props: ButtonProps) {
+  const { isShow, ...buttonProps } = props;
   return (
     <button
       css={css({
         zIndex: 9999,
-        color: "#000000",
-        backgroundColor: "#ffffff96",
-        backdropFilter: "blur(8px)",
-        border: "none",
+        color: "#f8fafc",
+        backgroundColor: "#1268d3",
+        border: "1px solid #3984df",
         padding: "0.75rem 1.25rem",
         borderRadius: "8px",
         fontWeight: "300",
         fontSize: "14px",
-        outline: "rgba(240, 240, 244, 0.51) solid 0.1rem",
         cursor: "pointer",
         transition: "0.2s",
-        display: props.isShow ? "" : "none",
+        display: isShow ? "" : "none",
         gap: "0.5rem",
         ":hover": {
           backgroundColor: "#ebeef0c2",
@@ -109,7 +107,7 @@ export function Button(props: ButtonProps) {
           cursor: "not-allowed",
         },
       })}
-      {...props}
+      {...buttonProps}
     >
       {props.children}
     </button>

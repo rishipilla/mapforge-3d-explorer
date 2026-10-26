@@ -36,9 +36,20 @@ export type PolylineElem = {
   geometry: Array<{ lat: number; lon: number }>;
 };
 
+export type IndoorFeature = {
+  id: number | string;
+  type: "node" | "way" | "relation";
+  tags: Record<string, string>;
+  paths: Array<{
+    role: string;
+    points: Array<{ lat: number; lon: number }>;
+  }>;
+};
+
 type AreaStore = {
   areas: any;
   roads: any[];
+  indoorFeatures: IndoorFeature[];
   parks: PolygonRing[];
   waterPolygons: PolygonRing[];
   rivers: PolylineElem[];
@@ -53,6 +64,7 @@ type AreaStore = {
 
   appendAreas: (areas: any[]) => void;
   setRoads: (roads: any[]) => void;
+  setIndoorFeatures: (features: IndoorFeature[]) => void;
   setParks: (parks: PolygonRing[]) => void;
   setWaterPolygons: (waterPolygons: PolygonRing[]) => void;
   setRivers: (rivers: PolylineElem[]) => void;
@@ -66,6 +78,7 @@ type AreaStore = {
 export const useAreaStore = create<AreaStore>((set) => ({
   areas: [],
   roads: [],
+  indoorFeatures: [],
   parks: [],
   waterPolygons: [],
   rivers: [],
@@ -79,6 +92,7 @@ export const useAreaStore = create<AreaStore>((set) => ({
   projection: null,
   appendAreas:      (areas)         => set(() => ({ areas: [...areas] })),
   setRoads:         (roads)         => set(() => ({ roads: [...roads] })),
+  setIndoorFeatures:(features)      => set(() => ({ indoorFeatures: [...features] })),
   setParks:         (parks)         => set(() => ({ parks: [...parks] })),
   setWaterPolygons: (waterPolygons) => set(() => ({ waterPolygons: [...waterPolygons] })),
   setRivers:        (rivers)        => set(() => ({ rivers: [...rivers] })),

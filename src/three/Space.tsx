@@ -1,21 +1,24 @@
 import { useEffect, useRef, useMemo, useState } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { useAreaStore } from "@/state/areaStore";
-import { Html, Sky, Environment } from "@react-three/drei";
+import { Edges, Html, Environment } from "@react-three/drei";
 import * as THREE from "three";
 import { useActionStore } from "@/state/exportStore";
+import type { IndoorFeature } from "@/state/areaStore";
 import { GLTFExporter } from "three/examples/jsm/Addons.js";
 import Car from "./Car";
 import instanceFleet from "@/api/axios";
+import { getBuildingStyle, ArchitecturalMaterials } from "@/materials/buildingMaterials";
+import { generateDemoInterior, type InteriorRoom } from "@/geometry/interiorGenerator";
 
-const ROAD_MAT = new THREE.MeshStandardMaterial({ color: "#3d3d3d" });
-const PATH_MAT = new THREE.MeshStandardMaterial({ color: "#888888" });
-const BUILDING_MAT = new THREE.MeshStandardMaterial({ color: "#9da0a3" });
-const BUILDING_ACTIVE_MAT = new THREE.MeshStandardMaterial({ color: "#007bff" });
+const ROAD_MAT = new THREE.MeshStandardMaterial({ color: "#364253", roughness: 0.92 });
+const PATH_MAT = new THREE.MeshStandardMaterial({ color: "#728096", roughness: 0.9 });
+const BUILDING_MAT = new THREE.MeshStandardMaterial({ color: "#aeb9c5", roughness: 0.82 });
+const BUILDING_ACTIVE_MAT = new THREE.MeshStandardMaterial({ color: "#60a5fa", roughness: 0.62 });
 // Opaque ground material used in GLB export
 const GROUND_MAT = new THREE.MeshStandardMaterial({ color: "#888888", roughness: 1, metalness: 0 });
 // Ghost version shown in the browser preview — same colour, barely visible
-const GROUND_PREVIEW_MAT = new THREE.MeshStandardMaterial({ color: "#888888", roughness: 1, metalness: 0, transparent: true, opacity: 0.15, depthWrite: false });
+const GROUND_PREVIEW_MAT = new THREE.MeshStandardMaterial({ color: "#64748b", roughness: 1, metalness: 0, transparent: true, opacity: 0.34, depthWrite: false });
 
 // ── New feature materials ──────────────────────────────────────────────────
 const PARK_MAT    = new THREE.MeshStandardMaterial({ color: "#4a7c59", roughness: 1, metalness: 0 });
@@ -40,73 +43,1431 @@ const RAILWAY_HALF_WIDTH = 0.8;
 // ── Flat extrude settings (thin slab for ground-level polygons) ────────────
 const FLAT_EXTRUDE = { steps: 1, depth: 0.05, bevelEnabled: false } as const;
 
+const MAX_BUILDING_FLOORS = 40;
+const DEFAULT_BUILDING_HEIGHT = 10;
+const DEFAULT_FLOOR_HEIGHT = 2.8;
+const REPORTED_LEVEL_HEIGHT = 2.2;
+const FLOOR_SLAB_THICKNESS = 0.3;
+const DEFAULT_EXPLODED_FLOOR_GAP_RATIO = 0.5;
+const BUILDING_FLOOR_HIGHLIGHT_MAT = new THREE.MeshStandardMaterial({
+  color: "#38bdf8",
+  roughness: 0.52,
+  metalness: 0.04,
+  emissive: "#075985",
+  emissiveIntensity: 0.16,
+});
+const INDOOR_ROOM_MAT = new THREE.MeshBasicMaterial({
+  color: "#38bdf8",
+  transparent: true,
+  opacity: 0.3,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+});
+const INDOOR_CORRIDOR_MAT = new THREE.MeshBasicMaterial({
+  color: "#94a3b8",
+  transparent: true,
+  opacity: 0.35,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+});
+const INDOOR_SELECTED_MAT = new THREE.MeshBasicMaterial({
+  color: "#f59e0b",
+  transparent: true,
+  opacity: 0.55,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+});
+
+type ProjectedIndoorFeature = {
+  id: number | string;
+  tags: Record<string, string>;
+  paths: Array<{ role: string; points: THREE.Vector2[] }>;
+  center: THREE.Vector2;
+};
+
+function getIndoorFeatureLevels(tags: Record<string, string>): number[] | null {
+  if (!tags.level) return null;
+  const parsed = tags.level.split(";").flatMap((rawLevel) => {
+    const level = rawLevel.trim();
+    const range = level.match(/^(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)$/);
+    if (range) {
+      const start = Number(range[1]);
+      const end = Number(range[2]);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || Math.abs(end - start) > 40) {
+        return [];
+      }
+      const step = start <= end ? 1 : -1;
+      return Array.from(
+        { length: Math.floor(Math.abs(end - start)) + 1 },
+        (_, index) => Math.round(start + index * step)
+      );
+    }
+    const value = Number(level);
+    return Number.isFinite(value) ? [Math.round(value)] : [];
+  });
+  const unique = [...new Set(parsed)];
+  return unique.length > 0 ? unique : null;
+}
+
+function makeClosedShape(points: THREE.Vector2[]): THREE.Shape | null {
+  if (points.length < 4 || !points[0].equals(points[points.length - 1])) return null;
+  const shape = new THREE.Shape();
+  shape.moveTo(points[0].x, points[0].y);
+  points.slice(1, -1).forEach((point) => shape.lineTo(point.x, point.y));
+  shape.closePath();
+  return shape;
+}
+
+function hasRenderableIndoorGeometry(feature: ProjectedIndoorFeature): boolean {
+  const indoor = feature.tags.indoor;
+  return feature.paths.some((path) => {
+    if (
+      (indoor === "room" || indoor === "corridor" || indoor === "ceiling") &&
+      path.role === "outer" &&
+      makeClosedShape(path.points)
+    ) {
+      return true;
+    }
+    if (
+      (indoor === "wall" ||
+        indoor === "door" ||
+        indoor === "window" ||
+        Boolean(feature.tags.door) ||
+        Boolean(feature.tags.window) ||
+        Boolean(feature.tags.entrance)) &&
+      path.points.length >= 2
+    ) {
+      return true;
+    }
+    return (
+      (indoor === "door" || Boolean(feature.tags.door) || Boolean(feature.tags.entrance)) &&
+      path.role === "point"
+    );
+  });
+}
+
+function getProceduralPartitionSegments(
+  shape: THREE.Shape
+): Array<[THREE.Vector2, THREE.Vector2]> {
+  const points = shape.getPoints();
+  const polygon =
+    points[0]?.equals(points[points.length - 1]) ? points.slice(0, -1) : points;
+  const bounds = new THREE.Box2().setFromPoints(polygon);
+  const segments: Array<[THREE.Vector2, THREE.Vector2]> = [];
+  const addPartition = (vertical: boolean, value: number) => {
+    const min = vertical ? bounds.min.y : bounds.min.x;
+    const max = vertical ? bounds.max.y : bounds.max.x;
+    const sampleCount = 128;
+    let start: THREE.Vector2 | null = null;
+    let lastInside: THREE.Vector2 | null = null;
+    const save = () => {
+      if (start && lastInside && start.distanceTo(lastInside) > 0.25) {
+        segments.push([start, lastInside]);
+      }
+      start = null;
+      lastInside = null;
+    };
+    for (let index = 0; index <= sampleCount; index += 1) {
+      const along = min + ((max - min) * index) / sampleCount;
+      const point = vertical
+        ? new THREE.Vector2(value, along)
+        : new THREE.Vector2(along, value);
+      if (isPointInPolygon(point, polygon)) {
+        start ??= point;
+        lastInside = point;
+      } else {
+        save();
+      }
+    }
+    save();
+  };
+  for (let division = 1; division <= 2; division += 1) {
+    const fraction = division / 3;
+    addPartition(true, bounds.min.x + (bounds.max.x - bounds.min.x) * fraction);
+    addPartition(false, bounds.min.y + (bounds.max.y - bounds.min.y) * fraction);
+  }
+  return segments;
+}
+
+function isPointInPolygon(point: THREE.Vector2, polygon: THREE.Vector2[]): boolean {
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index++) {
+    const a = polygon[index];
+    const b = polygon[previous];
+    const cross =
+      (point.x - a.x) * (b.y - a.y) -
+      (point.y - a.y) * (b.x - a.x);
+    if (
+      Math.abs(cross) < 1e-8 &&
+      point.x >= Math.min(a.x, b.x) &&
+      point.x <= Math.max(a.x, b.x) &&
+      point.y >= Math.min(a.y, b.y) &&
+      point.y <= Math.max(a.y, b.y)
+    ) {
+      return true;
+    }
+    const intersects =
+      (a.y > point.y) !== (b.y > point.y) &&
+      point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function MappedIndoorFeature({
+  feature,
+  floorLabel,
+  selected,
+  onSelect,
+  floorSurfaceHeight,
+}: {
+  feature: ProjectedIndoorFeature;
+  floorLabel: string;
+  selected: boolean;
+  onSelect: () => void;
+  floorSurfaceHeight: number;
+}) {
+  const areaGeometry = useMemo(() => {
+    if (
+      feature.tags.indoor !== "room" &&
+      feature.tags.indoor !== "corridor" &&
+      feature.tags.indoor !== "ceiling"
+    ) {
+      return [];
+    }
+    return feature.paths.flatMap((path) => {
+      if (path.role !== "outer") return [];
+      const shape = makeClosedShape(path.points);
+      return shape ? [new THREE.ShapeGeometry(shape)] : [];
+    });
+  }, [feature]);
+  const lineGeometry = useMemo(() => {
+    const points: THREE.Vector3[] = [];
+    for (const path of feature.paths) {
+      if (
+        feature.tags.indoor === "wall" ||
+        path.points.length < 2 ||
+        (path.role === "outer" &&
+          (feature.tags.indoor === "room" || feature.tags.indoor === "corridor") &&
+          makeClosedShape(path.points))
+      ) {
+        continue;
+      }
+      for (let index = 1; index < path.points.length; index += 1) {
+        const start = path.points[index - 1];
+        const end = path.points[index];
+        points.push(
+          new THREE.Vector3(start.x, floorSurfaceHeight + 0.045, -start.y),
+          new THREE.Vector3(end.x, floorSurfaceHeight + 0.045, -end.y)
+        );
+      }
+    }
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    return geometry;
+  }, [feature, floorSurfaceHeight]);
+
+  useEffect(() => {
+    return () => {
+      areaGeometry.forEach((geometry) => geometry.dispose());
+      lineGeometry.dispose();
+    };
+  }, [areaGeometry, lineGeometry]);
+
+  const material = selected
+    ? INDOOR_SELECTED_MAT
+    : feature.tags.indoor === "corridor"
+      ? INDOOR_CORRIDOR_MAT
+      : INDOOR_ROOM_MAT;
+  const point = feature.paths.find((path) => path.role === "point")?.points[0];
+  const hasEntrance =
+    Boolean(feature.tags.entrance) ||
+    Boolean(feature.tags.door) ||
+    feature.tags.indoor === "door";
+  const label =
+    feature.tags["room:name"] ||
+    feature.tags.name ||
+    feature.tags.ref ||
+    (feature.tags.indoor === "room" ? `Room ${feature.id}` : feature.tags.indoor);
+
+  return (
+    <group>
+      {areaGeometry.map((geometry, index) => (
+        <mesh
+          key={`area-${index}`}
+          geometry={geometry}
+          material={material}
+          position={[
+            0,
+            floorSurfaceHeight +
+              (feature.tags.indoor === "ceiling" ? 2.5 : 0.025),
+            0,
+          ]}
+          rotation={[-Math.PI / 2, 0, 0]}
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect();
+          }}
+        />
+      ))}
+      {lineGeometry.getAttribute("position").count > 0 && (
+        <lineSegments geometry={lineGeometry}>
+          <lineBasicMaterial color="#0f5d86" />
+        </lineSegments>
+      )}
+      {feature.tags.indoor === "wall" &&
+        feature.paths.flatMap((path) =>
+          path.points.slice(1).map((end, index) => {
+            const start = path.points[index];
+            const dx = end.x - start.x;
+            const dy = end.y - start.y;
+            const length = Math.hypot(dx, dy);
+            return length > 0 ? (
+              <mesh
+                key={`wall-${index}`}
+                position={[
+                  (start.x + end.x) / 2,
+                  floorSurfaceHeight + 1.25,
+                  -(start.y + end.y) / 2,
+                ]}
+                rotation={[0, Math.atan2(dy, dx), 0]}
+              >
+                <boxGeometry args={[length, 2.5, 0.12]} />
+                <meshStandardMaterial color="#d1d5db" roughness={0.85} />
+              </mesh>
+            ) : null;
+          })
+        )}
+      {hasEntrance && point && (
+        <mesh position={[point.x, floorSurfaceHeight + 0.12, -point.y]}>
+          <sphereGeometry args={[0.12, 8, 6]} />
+          <meshBasicMaterial color="#fbbf24" />
+        </mesh>
+      )}
+      {(feature.tags.indoor === "room" || feature.tags.indoor === "corridor") && (
+        <Html
+          position={[feature.center.x, floorSurfaceHeight + 0.11, -feature.center.y]}
+          center
+          distanceFactor={35}
+          style={{ pointerEvents: "none" }}
+        >
+          <div
+            style={{
+              padding: "2px 5px",
+              borderRadius: "3px",
+              background: selected ? "#b45309" : "rgba(15, 23, 42, 0.8)",
+              color: "#fff",
+              font: "600 10px system-ui, sans-serif",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {label} · {floorLabel}
+          </div>
+        </Html>
+      )}
+    </group>
+  );
+}
+
+function ProceduralInterior({
+  shape,
+  floorSurfaceHeight,
+  floorLevel,
+  selectedRoomId,
+  onRoomSelect,
+}: {
+  shape: THREE.Shape;
+  floorSurfaceHeight: number;
+  floorLevel: number;
+  selectedRoomId?: string | number | null;
+  onRoomSelect?: (room: InteriorRoom) => void;
+}) {
+  const { rooms, wallSegments, furnitureItems } = useMemo(
+    () => generateDemoInterior(shape, floorLevel),
+    [shape, floorLevel]
+  );
+
+  return (
+    <group userData={{ exportToGLB: true }}>
+      {/* Selectable Room Floor Surfaces with warm wood/tinted finish */}
+      {rooms.map((room) => {
+        const isSelected = selectedRoomId === room.id;
+        return (
+          <group key={room.id}>
+            <mesh
+              position={[0, floorSurfaceHeight + 0.02, 0]}
+              rotation={[-Math.PI / 2, 0, 0]}
+              onClick={(e) => {
+                e.stopPropagation();
+                onRoomSelect?.(room);
+              }}
+            >
+              <shapeGeometry args={[room.shape]} />
+              <meshStandardMaterial
+                color={isSelected ? "#38bdf8" : room.color}
+                roughness={0.65}
+                transparent
+                opacity={isSelected ? 0.65 : 0.28}
+                depthWrite={false}
+              />
+            </mesh>
+            {/* Interactive Room Label */}
+            <Html
+              position={[room.center.x, floorSurfaceHeight + 0.35, -room.center.y]}
+              center
+              distanceFactor={32}
+              style={{ pointerEvents: "none" }}
+            >
+              <div
+                style={{
+                  padding: "3px 6px",
+                  borderRadius: "4px",
+                  background: isSelected ? "rgba(2, 132, 199, 0.95)" : "rgba(15, 23, 42, 0.85)",
+                  color: "#fff",
+                  font: "600 10px system-ui, sans-serif",
+                  whiteSpace: "nowrap",
+                  border: isSelected ? "1px solid #38bdf8" : "1px solid rgba(255,255,255,0.15)",
+                  boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: "1px",
+                }}
+              >
+                <span>{room.name}</span>
+                <span style={{ fontSize: "8px", color: isSelected ? "#e0f2fe" : "#f59e0b", fontWeight: 700 }}>
+                  DEMO INTERIOR
+                </span>
+              </div>
+            </Html>
+          </group>
+        );
+      })}
+
+      {/* Architectural Partition Walls with Doorways */}
+      {wallSegments.map(([start, end], index) => {
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const length = Math.hypot(dx, dy);
+        if (length < 0.1) return null;
+        const wallHeight = 2.4;
+        return (
+          <mesh
+            key={`wall-${index}`}
+            position={[
+              (start.x + end.x) / 2,
+              floorSurfaceHeight + wallHeight / 2,
+              -(start.y + end.y) / 2,
+            ]}
+            rotation={[0, Math.atan2(dy, dx), 0]}
+            userData={{ exportToGLB: true }}
+          >
+            <boxGeometry args={[length, wallHeight, 0.12]} />
+            <meshStandardMaterial
+              color="#e2e8f0"
+              roughness={0.88}
+              metalness={0.02}
+            />
+          </mesh>
+        );
+      })}
+
+      {/* Architectural Low-Poly Furniture (Tables, Chairs, Desks, Sofas, Plants) */}
+      {furnitureItems.map((item) => (
+        <mesh
+          key={item.id}
+          position={[
+            item.position[0],
+            floorSurfaceHeight + item.position[1],
+            item.position[2],
+          ]}
+          rotation={[0, item.rotation, 0]}
+          userData={{ exportToGLB: true }}
+        >
+          <boxGeometry args={item.size} />
+          <meshStandardMaterial
+            color={item.color}
+            roughness={item.type === "plant" ? 0.9 : 0.6}
+            metalness={item.type === "chair" ? 0.3 : 0.05}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+function distanceToSegment(point: THREE.Vector2, start: THREE.Vector2, end: THREE.Vector2) {
+  const segment = end.clone().sub(start);
+  const lengthSquared = segment.lengthSq();
+  if (lengthSquared === 0) return point.distanceTo(start);
+  const fraction = THREE.MathUtils.clamp(
+    point.clone().sub(start).dot(segment) / lengthSquared,
+    0,
+    1
+  );
+  return point.distanceTo(start.clone().addScaledVector(segment, fraction));
+}
+
+function FirstPersonWalkthrough({
+  shape,
+  floorLevel,
+  floorHeight,
+  wallSegments,
+  onExit,
+}: {
+  shape: THREE.Shape;
+  floorLevel: number;
+  floorHeight: number;
+  wallSegments: Array<[THREE.Vector2, THREE.Vector2]>;
+  onExit: () => void;
+}) {
+  const { camera, gl } = useThree();
+  const keys = useRef(new Set<string>());
+  const yaw = useRef(0);
+  const pitch = useRef(0);
+  const position = useRef(new THREE.Vector3());
+  const onExitRef = useRef(onExit);
+  onExitRef.current = onExit;
+  const outline = useMemo(() => {
+    const points = shape.getPoints();
+    return points[0]?.equals(points[points.length - 1]) ? points.slice(0, -1) : points;
+  }, [shape]);
+  const centroid = useMemo(() => {
+    const sum = outline.reduce((result, point) => result.add(point), new THREE.Vector2());
+    return outline.length ? sum.multiplyScalar(1 / outline.length) : new THREE.Vector2();
+  }, [outline]);
+
+  useEffect(() => {
+    const floorY = floorLevel * floorHeight;
+    position.current.set(centroid.x, floorY + 1.65, -centroid.y);
+    camera.position.copy(position.current);
+    camera.rotation.order = "YXZ";
+    camera.rotation.set(0, yaw.current, 0);
+
+    const element = gl.domElement;
+    const handleClick = () => {
+      if (document.pointerLockElement !== element) {
+        void element.requestPointerLock();
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      if (["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
+        event.preventDefault();
+        keys.current.add(key);
+      }
+      if (key === "escape") {
+        if (document.pointerLockElement === element) document.exitPointerLock();
+        onExitRef.current();
+      }
+    };
+    const handleKeyUp = (event: KeyboardEvent) => keys.current.delete(event.key.toLowerCase());
+    const handleMouseMove = (event: MouseEvent) => {
+      if (document.pointerLockElement !== element) return;
+      yaw.current -= event.movementX * 0.002;
+      pitch.current = THREE.MathUtils.clamp(
+        pitch.current - event.movementY * 0.002,
+        -Math.PI / 2.4,
+        Math.PI / 2.4
+      );
+    };
+    element.addEventListener("click", handleClick);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    document.addEventListener("mousemove", handleMouseMove);
+    return () => {
+      element.removeEventListener("click", handleClick);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      document.removeEventListener("mousemove", handleMouseMove);
+      keys.current.clear();
+      if (document.pointerLockElement === element) document.exitPointerLock();
+    };
+  }, [camera, centroid, floorHeight, floorLevel, gl]);
+
+  useFrame((_, delta) => {
+    const input = keys.current;
+    const forwardInput = Number(input.has("w") || input.has("arrowup")) -
+      Number(input.has("s") || input.has("arrowdown"));
+    const sideInput = Number(input.has("d") || input.has("arrowright")) -
+      Number(input.has("a") || input.has("arrowleft"));
+    const forward = new THREE.Vector3(-Math.sin(yaw.current), 0, -Math.cos(yaw.current));
+    const right = new THREE.Vector3(Math.cos(yaw.current), 0, -Math.sin(yaw.current));
+    const movement = forward.multiplyScalar(forwardInput).addScaledVector(right, sideInput);
+    if (movement.lengthSq() > 0) {
+      movement.normalize().multiplyScalar(3 * Math.min(delta, 0.05));
+      const candidate = position.current.clone().add(movement);
+      const localPoint = new THREE.Vector2(candidate.x, -candidate.z);
+      const inside =
+        isPointInPolygon(localPoint, outline) &&
+        outline.every((point, index) => {
+          const next = outline[(index + 1) % outline.length];
+          return distanceToSegment(localPoint, point, next) >= 0.3;
+        });
+      const hitsWall = wallSegments.some(
+        ([start, end]) => distanceToSegment(localPoint, start, end) < 0.28
+      );
+      if (inside && !hitsWall) position.current.copy(candidate);
+    }
+    camera.position.copy(position.current);
+    camera.rotation.order = "YXZ";
+    camera.rotation.set(pitch.current, yaw.current, 0);
+  });
+
+  return null;
+}
+
+function parseOsmHeight(value: unknown): number | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const match = String(value).trim().match(/^(\d+(?:\.\d+)?)\s*(m|meter|meters|ft|feet|')?$/i);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return match[2]?.toLowerCase().startsWith("f") || match[2] === "'"
+    ? parsed * 0.3048
+    : parsed;
+}
+
+function parseOsmLevels(value: unknown): number | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const parsed = Number(String(value).trim());
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function formatMeters(value: number): string {
+  return `${Number(value.toFixed(1))} m`;
+}
+
+function BuildingFloor({
+  shape,
+  floorIndex,
+  floorLevel,
+  floorLabel,
+  floorHeight,
+  exploded,
+  floorGap,
+  active,
+  highlighted,
+  indoorFeatures,
+  showIndoorData,
+  showProceduralInterior,
+  selectedRoomId,
+  onRoomSelect,
+  onHover,
+  onPointerMove,
+  onPointerOut,
+  onClick,
+  labelPosition,
+  labelDistanceFactor,
+}: {
+  shape: THREE.Shape;
+  floorIndex: number;
+  floorLevel: number;
+  floorLabel: string;
+  floorHeight: number;
+  exploded: boolean;
+  floorGap: number;
+  active: boolean;
+  highlighted: boolean;
+  indoorFeatures: ProjectedIndoorFeature[];
+  showIndoorData: boolean;
+  showProceduralInterior: boolean;
+  selectedRoomId: number | string | null;
+  onRoomSelect: (feature: ProjectedIndoorFeature | InteriorRoom) => void;
+  onHover: (event: any) => void;
+  onPointerMove: (event: any) => void;
+  onPointerOut: (event: any) => void;
+  onClick: (event: any) => void;
+  labelPosition: [number, number, number];
+  labelDistanceFactor: number;
+}) {
+  const floorRef = useRef<THREE.Group>(null!);
+  const floorSurfaceHeight = FLOOR_SLAB_THICKNESS;
+  const extrudeSettings = useMemo(
+    () => ({ steps: 1, depth: FLOOR_SLAB_THICKNESS, bevelEnabled: false }),
+    []
+  );
+
+  useFrame((_, delta) => {
+    if (!floorRef.current) return;
+    const targetY = floorLevel * floorHeight +
+      (exploded ? floorIndex * floorGap : 0);
+    floorRef.current.position.y = THREE.MathUtils.damp(
+      floorRef.current.position.y,
+      targetY,
+      6,
+      delta
+    );
+  });
+
+  return (
+    <group ref={floorRef} position={[0, floorLevel * floorHeight, 0]}>
+      <mesh
+        rotation={[-Math.PI / 2, 0, 0]}
+        material={
+          highlighted
+            ? BUILDING_FLOOR_HIGHLIGHT_MAT
+            : active
+              ? BUILDING_ACTIVE_MAT
+              : ArchitecturalMaterials.Concrete()
+        }
+        onPointerOver={onHover}
+        onPointerMove={onPointerMove}
+        onPointerOut={onPointerOut}
+        onClick={onClick}
+      >
+        <extrudeGeometry args={[shape, extrudeSettings]} />
+        <Edges threshold={18} color={highlighted ? "#075985" : "#334155"} />
+      </mesh>
+      {showIndoorData &&
+        indoorFeatures
+          .filter((feature) => {
+            const levels = getIndoorFeatureLevels(feature.tags);
+            return levels === null ? floorLevel === 0 : levels.includes(floorLevel);
+          })
+          .map((feature) => (
+            <MappedIndoorFeature
+              key={`${feature.id}-${floorLevel}`}
+              feature={feature}
+              floorLabel={floorLabel}
+              selected={selectedRoomId === feature.id}
+              onSelect={() => onRoomSelect(feature)}
+              floorSurfaceHeight={floorSurfaceHeight}
+            />
+          ))}
+      {showProceduralInterior && (
+        <ProceduralInterior
+          shape={shape}
+          floorSurfaceHeight={floorSurfaceHeight}
+          floorLevel={floorLevel}
+          selectedRoomId={selectedRoomId}
+          onRoomSelect={onRoomSelect}
+        />
+      )}
+      {exploded && (
+        <Html
+          position={labelPosition}
+          center
+          distanceFactor={labelDistanceFactor * 1.35}
+          style={{ pointerEvents: "none" }}
+        >
+          <div
+            style={{
+              padding: "3px 7px",
+              borderRadius: "5px",
+              color: "#ffffff",
+              background: "rgba(15, 23, 42, 0.88)",
+              border: "1px solid rgba(56, 189, 248, 0.8)",
+              font: "600 11px system-ui, sans-serif",
+              whiteSpace: "nowrap",
+              boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
+            }}
+          >
+            Floor {floorLabel}
+          </div>
+        </Html>
+      )}
+    </group>
+  );
+}
+
 function Building({
   shape,
-  extrudeSettings,
+  height,
+  floorCount,
+  reportedFloorCount,
+  heightIsEstimated,
+  floorCountIsEstimated,
+  indoorFeatures,
+  indoorDataStatus,
+  indoorDataError,
+  onIndoorDataRetry,
+  cameraView,
+  onCameraViewChange,
+  activeWalkthroughFloor,
+  onWalkthroughFloorChange,
+  buildingId,
+  isSelected,
+  inspectorOpen,
+  onInspectorOpenChange,
+  onSelect,
   tags,
 }: {
   shape: THREE.Shape;
-  extrudeSettings: any;
+  height: number;
+  floorCount: number;
+  reportedFloorCount: number | null;
+  heightIsEstimated: boolean;
+  floorCountIsEstimated: boolean;
+  indoorFeatures: ProjectedIndoorFeature[];
+  indoorDataStatus: "idle" | "loading" | "loaded" | "error";
+  indoorDataError: string;
+  onIndoorDataRetry: () => void;
+  cameraView: "orbit" | "topdown" | "walkthrough";
+  onCameraViewChange: (view: "orbit" | "topdown" | "walkthrough") => void;
+  activeWalkthroughFloor: number;
+  onWalkthroughFloorChange: (level: number) => void;
+  buildingId: string;
+  isSelected: boolean;
+  inspectorOpen: boolean;
+  onInspectorOpenChange: (open: boolean) => void;
+  onSelect: (id: string | null) => void;
   tags: any;
 }) {
   const [hovered, setHovered] = useState(false);
-  const [clicked, setClicked] = useState(false);
+  const [viewMode, setViewMode] = useState<"building" | "floor" | "exploded">("building");
+  const [explorationActive, setExplorationActive] = useState(false);
+  const [showFloorGeometry, setShowFloorGeometry] = useState(false);
+  const [selectedFloor, setSelectedFloor] = useState<number | null>(null);
+  const [selectedRoom, setSelectedRoom] = useState<ProjectedIndoorFeature | InteriorRoom | null>(null);
+  const [floorGapRatio, setFloorGapRatio] = useState(DEFAULT_EXPLODED_FLOOR_GAP_RATIO);
+  const [showIndoorData, setShowIndoorData] = useState(false);
+  const [showProceduralInterior, setShowProceduralInterior] = useState(false);
   const [hoverPos, setHoverPos] = useState<THREE.Vector3 | null>(null);
   const [showTranslations, setShowTranslations] = useState(false);
   const [showAdditionalInfo, setShowAdditionalInfo] = useState(false);
+  const buildingStyle = useMemo(() => getBuildingStyle(tags, isSelected), [tags, isSelected]);
+  const floorHeight = height / floorCount;
+  const floorGap = floorHeight * floorGapRatio;
+  const exploded = viewMode === "exploded";
+  const floorLevels = useMemo(() => {
+    const mappedLevels = indoorFeatures.flatMap(
+      (feature) => getIndoorFeatureLevels(feature.tags) ?? []
+    );
+    const minLevel = Math.min(0, ...mappedLevels);
+    const maxLevel = Math.max(floorCount - 1, ...mappedLevels);
+    const count = Math.min(MAX_BUILDING_FLOORS, maxLevel - minLevel + 1);
+    return Array.from({ length: count }, (_, index) => minLevel + index);
+  }, [floorCount, indoorFeatures]);
+  const mappedFeatureCount = indoorFeatures.filter((feature) => {
+    return hasRenderableIndoorGeometry(feature);
+  }).length;
+  const roomCount = (level: number) =>
+    indoorFeatures.filter((feature) => {
+      if (feature.tags.indoor !== "room") return false;
+      if (!hasRenderableIndoorGeometry(feature)) return false;
+      const levels = getIndoorFeatureLevels(feature.tags);
+      return levels === null ? level === 0 : levels.includes(level);
+    }).length;
+  const floorLabel = (level: number) =>
+    level < 0 ? `B${Math.abs(level)}` : level === 0 ? "G" : String(level);
+  const buildingExtrudeSettings = useMemo(
+    () => ({ steps: 1, depth: height, bevelEnabled: false }),
+    [height]
+  );
+  const labelPosition = useMemo<[number, number, number]>(() => {
+    const points = shape.getPoints();
+    const bounds = points.reduce(
+      (result, point) => ({
+        minX: Math.min(result.minX, point.x),
+        maxX: Math.max(result.maxX, point.x),
+        minY: Math.min(result.minY, point.y),
+        maxY: Math.max(result.maxY, point.y),
+      }),
+      { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity }
+    );
+    return [
+      bounds.maxX + 0.8,
+      floorHeight + 0.15,
+      -(bounds.minY + bounds.maxY) / 2,
+    ];
+  }, [shape, floorHeight]);
+
+  useEffect(() => {
+    if (!isSelected) {
+      setViewMode("building");
+      setExplorationActive(false);
+      setSelectedRoom(null);
+      setSelectedFloor(null);
+      setShowIndoorData(false);
+      setShowProceduralInterior(false);
+    }
+    if (
+      showFloorGeometry &&
+      viewMode === "building" &&
+      !showIndoorData &&
+      !showProceduralInterior
+    ) {
+      const collapseTimer = window.setTimeout(() => setShowFloorGeometry(false), 550);
+      return () => window.clearTimeout(collapseTimer);
+    }
+  }, [isSelected, viewMode, showFloorGeometry, showIndoorData, showProceduralInterior]);
+
+  const handleFloorClick = (floorIndex: number, event: any) => {
+    event.stopPropagation();
+    if (!isSelected) {
+      onSelect(buildingId);
+    }
+    setExplorationActive(true);
+    setSelectedFloor(floorIndex);
+    onWalkthroughFloorChange(floorIndex);
+    setViewMode("floor");
+    setShowFloorGeometry(true);
+  };
+
   return (
-    <mesh
-      onPointerOver={(e) => {
-        setHovered(true);
-        e.stopPropagation();
-      }}
-      onPointerOut={(e) => {
-        setHovered(false);
-        e.stopPropagation();
-      }}
-      onPointerMove={(e) => {
-        setHoverPos(e.point.clone());
-        e.stopPropagation();
-      }}
-      onClick={(e) => {
-        setClicked(!clicked);
-        e.stopPropagation();
-      }}
-      rotation={[-Math.PI / 2, 0, 0]}
-      material={hovered || clicked ? BUILDING_ACTIVE_MAT : BUILDING_MAT}
-      userData={{ exportToGLB: true }}
-    >
-      <extrudeGeometry args={[shape, extrudeSettings]} />
-      {(hovered || clicked) && hoverPos && (
-        <Html position={[hoverPos.x, hoverPos.y + extrudeSettings.depth + 0.5, hoverPos.z]} center>
-          <div
-            role="dialog"
-            aria-label={tags.name || "Building Information"}
-            style={{
-              color: "#000000",
-              backgroundColor: "#ffffff96",
-              backdropFilter: "blur(8px)",
-              border: "none",
-              padding: "14px",
-              borderRadius: "10px",
-              fontFamily: "system-ui, -apple-system, sans-serif",
-              fontSize: "13px",
-              width: "200px",
-              boxShadow: "0 2px 14px rgba(0, 0, 0, 0.16)",
-              transition: "all 0.2s ease-in-out",
+    <group userData={{ exportToGLB: true, buildingTags: tags }}>
+      {showFloorGeometry ? (
+        floorLevels.map((floorLevel, floorIndex) => (
+          (viewMode !== "floor" || selectedFloor === floorLevel) && (
+          <BuildingFloor
+            key={floorLevel}
+            shape={shape}
+            floorIndex={floorIndex}
+            floorLevel={floorLevel}
+            floorLabel={floorLabel(floorLevel)}
+            floorHeight={floorHeight}
+            exploded={exploded}
+            floorGap={floorGap}
+            active={hovered || isSelected}
+            highlighted={selectedFloor === floorLevel}
+            indoorFeatures={indoorFeatures}
+            showIndoorData={showIndoorData}
+            showProceduralInterior={showProceduralInterior}
+            selectedRoomId={selectedRoom?.id ?? null}
+            onRoomSelect={(feature) => setSelectedRoom(feature)}
+            onHover={(event) => {
+              setHovered(true);
+              event.stopPropagation();
             }}
+            onPointerMove={(event) => {
+              setHoverPos(event.point.clone());
+              event.stopPropagation();
+            }}
+            onPointerOut={(event) => {
+              setHovered(false);
+              event.stopPropagation();
+            }}
+            onClick={(event) => handleFloorClick(floorLevel, event)}
+            labelPosition={labelPosition}
+            labelDistanceFactor={height * 2.8}
+          />
+          )
+        ))
+      ) : (
+        <mesh
+          rotation={[-Math.PI / 2, 0, 0]}
+          material={hovered || isSelected ? ArchitecturalMaterials.Highlight() : buildingStyle.facadeMaterial}
+          onPointerOver={(event) => {
+            setHovered(true);
+            event.stopPropagation();
+          }}
+          onPointerMove={(event) => {
+            setHoverPos(event.point.clone());
+            event.stopPropagation();
+          }}
+          onPointerOut={(event) => {
+            setHovered(false);
+            event.stopPropagation();
+          }}
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect(isSelected ? null : buildingId);
+          }}
+        >
+          <extrudeGeometry args={[shape, buildingExtrudeSettings]} />
+        </mesh>
+      )}
+        {hovered && !isSelected && hoverPos && (
+          <Html
+            position={[hoverPos.x, height + 0.5, hoverPos.z]}
+            center
+            style={{ pointerEvents: "none" }}
           >
             <div
               style={{
-                fontWeight: "600",
-                fontSize: "15px",
-                borderBottom: tags.name ? "1px solid rgba(0, 0, 0, 0.08)" : "none",
-                paddingBottom: tags.name ? "6px" : "0",
-                marginBottom: tags.name ? "8px" : "4px",
+                padding: "6px 9px",
+                color: "#f8fafc",
+                background: "#101b2b",
+                border: "1px solid #334155",
+                borderRadius: "6px",
+                font: "600 12px system-ui, sans-serif",
+                whiteSpace: "nowrap",
               }}
             >
-              {tags.name || "Building Information"}
+              {tags.name || "Building"}
             </div>
+          </Html>
+        )}
+        {isSelected && inspectorOpen && (
+          <Html fullscreen style={{ pointerEvents: "none" }}>
+            <div
+              role="dialog"
+              aria-label={tags.name || "Building Information"}
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+              className="building-inspector-panel"
+              style={{
+                pointerEvents: "auto",
+                color: "#182334",
+                backgroundColor: "#f8fafc",
+                border: "1px solid #cbd5e1",
+                padding: "18px",
+                borderRadius: "12px",
+                fontFamily: "system-ui, -apple-system, sans-serif",
+                fontSize: "13px",
+                boxSizing: "border-box",
+                boxShadow: "0 16px 42px rgba(2, 8, 23, 0.28)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "12px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  justifyContent: "space-between",
+                  gap: "10px",
+                  paddingBottom: "12px",
+                  borderBottom: "1px solid #dbe2ea",
+                }}
+              >
+                <div>
+                  <div style={{ color: "#64748b", fontSize: "10px", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase" }}>
+                    Building inspector
+                  </div>
+                  <div style={{ marginTop: "4px", color: "#0f172a", fontWeight: 700, fontSize: "18px", lineHeight: 1.25 }}>
+                    {tags.name || "Unnamed building"}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Collapse building inspector"
+                  onClick={() => onInspectorOpenChange(false)}
+                  style={{
+                    flex: "0 0 auto",
+                    border: "1px solid #cbd5e1",
+                    borderRadius: "6px",
+                    color: "#334155",
+                    background: "#ffffff",
+                    padding: "6px 9px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Hide
+                </button>
+              </div>
+            {isSelected && (
+              <section
+                aria-label="Exploded floor controls"
+                style={{
+                  margin: "10px 0 8px",
+                  borderTop: "1px solid rgba(0, 0, 0, 0.1)",
+                  paddingTop: "9px",
+                }}
+              >
+                <div style={{ fontWeight: 700, color: "#111827", marginBottom: "6px" }}>
+                Floor analysis
+                </div>
+                <div style={{ color: "#475569", fontSize: "12px", lineHeight: 1.5 }}>
+                  <div>
+                    {floorCountIsEstimated
+                      ? `Estimated: ${floorCount} floor sections`
+                      : `Reported: ${reportedFloorCount} levels · ${floorCount} floor sections`}
+                    {reportedFloorCount !== null && reportedFloorCount > MAX_BUILDING_FLOORS
+                      ? ` (display capped at ${MAX_BUILDING_FLOORS})`
+                      : ""}
+                  </div>
+                  <div>
+                    Height: {formatMeters(height)} ({heightIsEstimated ? "estimated" : "OSM"})
+                  </div>
+                  <div>Average section: {formatMeters(floorHeight)} (derived)</div>
+                </div>
+                <div
+                  style={{
+                    marginTop: "6px",
+                    color: "#64748b",
+                    fontSize: "11px",
+                    lineHeight: 1.4,
+                  }}
+                >
+                  Illustrative floor sections only; not architectural plans.
+                </div>
+                <div
+                  aria-live="polite"
+                  style={{
+                    marginTop: "9px",
+                    padding: "8px",
+                    borderRadius: "6px",
+                    background: "#eef4fa",
+                    color: "#334155",
+                    fontSize: "11px",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  {indoorDataStatus === "loading" && "Loading mapped indoor data from OpenStreetMap..."}
+                  {indoorDataStatus === "error" && (
+                    <>
+                      <div>{indoorDataError || "Indoor map data could not be loaded."}</div>
+                      <button
+                        type="button"
+                        onClick={onIndoorDataRetry}
+                        style={{
+                          marginTop: "6px",
+                          border: "1px solid #94a3b8",
+                          borderRadius: "4px",
+                          padding: "4px 8px",
+                          background: "#ffffff",
+                          color: "#1e293b",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Retry map data
+                      </button>
+                    </>
+                  )}
+                  {indoorDataStatus === "loaded" && mappedFeatureCount > 0 && (
+                    <>
+                      <div>
+                        {mappedFeatureCount} mapped interior feature{mappedFeatureCount === 1 ? "" : "s"} · OpenStreetMap
+                      </div>
+                      <div>Unlevelled features are shown on the ground floor; mapped level tags determine other floors.</div>
+                      <button
+                        type="button"
+                        aria-pressed={showIndoorData}
+                        onClick={() => {
+                          const next = !showIndoorData;
+                          setShowIndoorData(next);
+                          setShowProceduralInterior(false);
+                          if (next) {
+                            setShowFloorGeometry(true);
+                            setExplorationActive(true);
+                            setViewMode("exploded");
+                          }
+                        }}
+                        style={{
+                          width: "100%",
+                          marginTop: "7px",
+                          border: "1px solid #0284c7",
+                          borderRadius: "5px",
+                          padding: "6px",
+                          color: showIndoorData ? "#ffffff" : "#075985",
+                          background: showIndoorData ? "#0284c7" : "#ffffff",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {showIndoorData ? "Hide mapped interiors" : "Explode & show mapped interiors"}
+                      </button>
+                    </>
+                  )}
+                  {indoorDataStatus === "loaded" && mappedFeatureCount === 0 && (
+                    <>
+                      <div>No mapped room, corridor, wall, door, or entrance data found for this building.</div>
+                      <div>Procedural partitions are illustrative only and are not real floor plans.</div>
+                      <button
+                        type="button"
+                        aria-pressed={showProceduralInterior}
+                        onClick={() => {
+                          const next = !showProceduralInterior;
+                          setShowProceduralInterior(next);
+                          setShowIndoorData(false);
+                          if (next) {
+                            setShowFloorGeometry(true);
+                            setExplorationActive(true);
+                            setViewMode("exploded");
+                          }
+                        }}
+                        style={{
+                          width: "100%",
+                          marginTop: "7px",
+                          border: "1px solid #d97706",
+                          borderRadius: "5px",
+                          padding: "6px",
+                          color: showProceduralInterior ? "#ffffff" : "#92400e",
+                          background: showProceduralInterior ? "#d97706" : "#ffffff",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {showProceduralInterior
+                          ? "Hide procedural interior"
+                          : "Show procedural interior · illustrative"}
+                      </button>
+                    </>
+                  )}
+                  {indoorDataStatus === "idle" && "Generate a map to check for available indoor data."}
+                </div>
+                {!explorationActive ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExplorationActive(true);
+                      setShowFloorGeometry(true);
+                      setViewMode("floor");
+                      setSelectedFloor(0);
+                      onWalkthroughFloorChange(0);
+                      if (mappedFeatureCount > 0) setShowIndoorData(true);
+                    }}
+                    style={{
+                      width: "100%",
+                      marginTop: "9px",
+                      padding: "8px 10px",
+                      border: "0",
+                      borderRadius: "6px",
+                      color: "#ffffff",
+                      background: "#1268d3",
+                      font: "600 13px system-ui, sans-serif",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Enter exploration mode
+                  </button>
+                ) : (
+                  <>
+                    <div style={{ display: "flex", gap: "4px", marginTop: "9px" }}>
+                      {([
+                        ["building", "Full building"],
+                        ["floor", "Isolate floor"],
+                        ["exploded", "Exploded"],
+                      ] as const).map(([mode, label]) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          aria-pressed={viewMode === mode}
+                          onClick={() => {
+                            setViewMode(mode);
+                            setShowFloorGeometry(mode !== "building");
+                            if (mode === "exploded" && selectedFloor === null) {
+                              setSelectedFloor(0);
+                            }
+                          }}
+                          style={{
+                            flex: 1,
+                            border: viewMode === mode ? "1px solid #0284c7" : "1px solid #cbd5e1",
+                            borderRadius: "5px",
+                            padding: "6px 3px",
+                            color: viewMode === mode ? "#ffffff" : "#1e293b",
+                            background: viewMode === mode ? "#0284c7" : "#ffffff",
+                            fontSize: "10px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", gap: "4px", marginTop: "5px" }}>
+                      {(["orbit", "topdown", "walkthrough"] as const).map((view) => (
+                        <button
+                          key={view}
+                          type="button"
+                          aria-pressed={cameraView === view}
+                          onClick={() => {
+                            if (view === "walkthrough") {
+                              setExplorationActive(true);
+                              setShowFloorGeometry(true);
+                              setShowIndoorData(mappedFeatureCount > 0);
+                              setShowProceduralInterior(mappedFeatureCount === 0);
+                              if (viewMode === "building") setViewMode("floor");
+                              if (selectedFloor === null) {
+                                setSelectedFloor(0);
+                                onWalkthroughFloorChange(0);
+                              } else {
+                                onWalkthroughFloorChange(selectedFloor);
+                              }
+                            }
+                            onCameraViewChange(view);
+                          }}
+                          style={{
+                            flex: 1,
+                            border: cameraView === view ? "1px solid #0284c7" : "1px solid #cbd5e1",
+                            borderRadius: "5px",
+                            padding: "6px 3px",
+                            color: cameraView === view ? "#ffffff" : "#1e293b",
+                            background: cameraView === view ? "#0284c7" : "#ffffff",
+                            fontSize: "10px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {view === "topdown" ? "Top-down" : view === "walkthrough" ? "Walkthrough" : "Orbit"}
+                        </button>
+                      ))}
+                    </div>
+                    {cameraView === "walkthrough" && (
+                      <div
+                        style={{
+                          marginTop: "5px",
+                          borderRadius: "5px",
+                          background: "#0f172a",
+                          color: "#e2e8f0",
+                          padding: "7px",
+                          fontSize: "10px",
+                        }}
+                      >
+                        Click the 3D view, then use WASD and mouse-look · Esc to exit
+                      </div>
+                    )}
+                    {cameraView === "walkthrough" && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onCameraViewChange("orbit");
+                          setExplorationActive(false);
+                          setViewMode("building");
+                          setShowFloorGeometry(false);
+                        }}
+                        style={{
+                          width: "100%",
+                          marginTop: "5px",
+                          border: "1px solid #b91c1c",
+                          borderRadius: "5px",
+                          padding: "6px",
+                          color: "#991b1b",
+                          background: "#fff",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Exit walkthrough
+                      </button>
+                    )}
+                    <div style={{ marginTop: "8px", color: "#475569", fontSize: "11px" }}>
+                      Floors · mapped rooms
+                    </div>
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
+                        gap: "4px",
+                        maxHeight: "112px",
+                        overflowY: "auto",
+                      }}
+                    >
+                      {floorLevels.map((level) => (
+                        <button
+                          key={level}
+                          type="button"
+                          aria-pressed={selectedFloor === level}
+                          onClick={() => {
+                            setSelectedFloor(level);
+                            onWalkthroughFloorChange(level);
+                            setViewMode("floor");
+                            setShowFloorGeometry(true);
+                          }}
+                          style={{
+                            padding: "5px 2px",
+                            border: selectedFloor === level ? "1px solid #0284c7" : "1px solid #cbd5e1",
+                            borderRadius: "4px",
+                            color: selectedFloor === level ? "#ffffff" : "#1e293b",
+                            background: selectedFloor === level ? "#0284c7" : "#ffffff",
+                            font: "500 10px system-ui, sans-serif",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {floorLabel(level)} · {roomCount(level)}
+                        </button>
+                      ))}
+                    </div>
+                    {selectedRoom && (
+                      <div
+                        style={{
+                          marginTop: "8px",
+                          padding: "8px",
+                          border: "1px solid #0284c7",
+                          borderRadius: "6px",
+                          background: "source" in selectedRoom && selectedRoom.source === "demo_generated" ? "#f0fdf4" : "#fffbeb",
+                          color: "source" in selectedRoom && selectedRoom.source === "demo_generated" ? "#166534" : "#78350f",
+                          fontSize: "11px",
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                          <strong>
+                            {"tags" in selectedRoom
+                              ? selectedRoom.tags["room:name"] || selectedRoom.tags.name || `Room ${selectedRoom.id}`
+                              : selectedRoom.name}
+                          </strong>
+                          <span
+                            style={{
+                              fontSize: "9px",
+                              fontWeight: 700,
+                              padding: "2px 5px",
+                              borderRadius: "4px",
+                              background: "source" in selectedRoom && selectedRoom.source === "demo_generated" ? "#bbf7d0" : "#fed7aa",
+                              color: "source" in selectedRoom && selectedRoom.source === "demo_generated" ? "#14532d" : "#9a3412",
+                            }}
+                          >
+                            {"source" in selectedRoom && selectedRoom.source === "demo_generated" ? "DEMO LAYOUT" : "REAL OSM DATA"}
+                          </span>
+                        </div>
+                        <div>Floor: {selectedFloor !== null ? floorLabel(selectedFloor) : "N/A"}</div>
+                        <div>
+                          {"tags" in selectedRoom
+                            ? `Source: OpenStreetMap · indoor=${selectedRoom.tags.indoor}`
+                            : `Type: ${selectedRoom.type.toUpperCase()} · Architectural layout simulation`}
+                        </div>
+                        <div>
+                          {"tags" in selectedRoom && (selectedRoom.tags.width || selectedRoom.tags.length)
+                            ? `Dimensions: ${selectedRoom.tags.width || "unknown"} × ${selectedRoom.tags.length || "unknown"} m`
+                            : "Dimensions: Proportional to floor footprint"}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+                {exploded && (
+                  <label
+                    style={{
+                      display: "block",
+                      marginTop: "9px",
+                      color: "#475569",
+                      fontSize: "11px",
+                    }}
+                  >
+                    Floor separation: {Math.round(floorGapRatio * 100)}% of floor height
+                    <input
+                      aria-label="Floor separation"
+                      type="range"
+                      min="0.05"
+                      max="0.8"
+                      step="0.05"
+                      value={floorGapRatio}
+                      onChange={(event) => setFloorGapRatio(Number(event.target.value))}
+                      style={{ width: "100%", display: "block", accentColor: "#0284c7" }}
+                    />
+                  </label>
+                )}
+                {exploded && (
+                  <div style={{ marginTop: "9px" }}>
+                    <div style={{ color: "#475569", fontSize: "12px", marginBottom: "5px" }}>
+                      Highlight a floor
+                    </div>
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
+                        gap: "4px",
+                        maxHeight: "112px",
+                        overflowY: "auto",
+                      }}
+                    >
+                      {Array.from({ length: floorCount }, (_, floorIndex) => (
+                        <button
+                          key={floorIndex}
+                          type="button"
+                          aria-pressed={selectedFloor === floorIndex}
+                          onClick={() =>
+                            setSelectedFloor((current) =>
+                              current === floorIndex ? null : floorIndex
+                            )
+                          }
+                          style={{
+                            padding: "5px 2px",
+                            border: selectedFloor === floorIndex
+                              ? "1px solid #0284c7"
+                              : "1px solid #cbd5e1",
+                            borderRadius: "4px",
+                            color: selectedFloor === floorIndex ? "#ffffff" : "#1e293b",
+                            background: selectedFloor === floorIndex ? "#0284c7" : "#ffffff",
+                            font: "500 10px system-ui, sans-serif",
+                            cursor: "pointer",
+                          }}
+                        >
+                          {floorIndex + 1}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
             {["building", "height", "building:levels", "amenity", "denomination"].map(
               (key) =>
                 tags[key] &&
@@ -134,7 +1495,9 @@ function Building({
                       :
                     </span>
                     <span style={{ textTransform: "capitalize" }}>
-                      {key === "height" ? `${tags[key]} m` : tags[key]}
+                      {key === "height"
+                        ? `${tags[key]}${/(?:m|meters?|ft|feet|')\s*$/i.test(String(tags[key]).trim()) ? "" : " m"}`
+                        : tags[key]}
                     </span>
                   </div>
                 )
@@ -338,7 +1701,7 @@ function Building({
           </div>
         </Html>
       )}
-    </mesh>
+    </group>
   );
 }
 
@@ -674,6 +2037,7 @@ function RoadMesh({
   useEffect(() => {
     meshRef.current.userData.exportToGLB = true;
   }, []);
+
   return (
     <mesh ref={meshRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, yPos, 0]} material={material}>
       <extrudeGeometry args={[shape, ROAD_EXTRUDE]} />
@@ -991,9 +2355,24 @@ export function Export() {
 
   const exportGLB = () => {
     const exportRoot = new THREE.Group();
+    const cloneExportable = (source: THREE.Object3D): THREE.Object3D | null => {
+      if (source.userData?.excludeFromGLB === true) return null;
+      const clone = source.clone(false);
+      source.children.forEach((child) => {
+        const childClone = cloneExportable(child);
+        if (childClone) clone.add(childClone);
+      });
+      return clone;
+    };
     scene.traverse((child) => {
       if (child.userData?.exportToGLB === true) {
-        const clone = child.clone(true);
+        let parent = child.parent;
+        while (parent && parent !== scene) {
+          if (parent.userData?.exportToGLB === true) return;
+          parent = parent.parent;
+        }
+        const clone = cloneExportable(child);
+        if (!clone) return;
         // Swap preview material → opaque export material on the ground plane
         if (child.userData?.groundPlane === true && clone instanceof THREE.Mesh) {
           clone.material = GROUND_MAT;
@@ -1035,9 +2414,39 @@ export function Export() {
   return null;
 }
 
-export function Space() {
+export function Space({
+  inspectorOpen,
+  onInspectorOpenChange,
+  indoorDataStatus,
+  indoorDataError,
+  onIndoorDataRetry,
+  cameraView,
+  onCameraViewChange,
+}: {
+  inspectorOpen: boolean;
+  onInspectorOpenChange: (open: boolean) => void;
+  indoorDataStatus: "idle" | "loading" | "loaded" | "error";
+  indoorDataError: string;
+  onIndoorDataRetry: () => void;
+  cameraView: "orbit" | "topdown" | "walkthrough";
+  onCameraViewChange: (view: "orbit" | "topdown" | "walkthrough") => void;
+}) {
   const areas = useAreaStore((state) => state.areas);
+  const indoorFeatures = useAreaStore((state) => state.indoorFeatures);
   const projection = useAreaStore((state) => state.projection);
+  const [selectedBuildingId, setSelectedBuildingId] = useState<string | null>(null);
+  const [activeWalkthroughFloor, setActiveWalkthroughFloor] = useState(0);
+
+  useEffect(() => {
+    if (cameraView === "walkthrough" && !selectedBuildingId) {
+      onCameraViewChange("orbit");
+    }
+  }, [cameraView, onCameraViewChange, selectedBuildingId]);
+
+  useEffect(() => {
+    setSelectedBuildingId(null);
+    setActiveWalkthroughFloor(0);
+  }, [areas, projection]);
 
   // Ground plane dimensions — frozen at generation time via projection store.
   // Never recalculates on canvas/viewport resize.
@@ -1049,12 +2458,29 @@ export function Space() {
       groundSceneDepth: (bbox.maxLat - bbox.minLat) * scaleY * 1.2,
     };
   }, [projection]);
+  const sceneSpan = Math.max(groundSceneWidth, groundSceneDepth, 40);
+  const cameraDistance = sceneSpan * 1.7;
 
   const buildingsData = useMemo(() => {
     if (!projection) return [];
     const { refLat, refLng, scaleX, scaleY } = projection;
-    const result: Array<{ shape: THREE.Shape; extrudeSettings: any; tags: any }> = [];
-    areas.forEach((bld: any) => {
+    const result: Array<{
+      buildingId: string;
+      shape: THREE.Shape;
+      height: number;
+      floorCount: number;
+      reportedFloorCount: number | null;
+      heightIsEstimated: boolean;
+      floorCountIsEstimated: boolean;
+      focusTarget: THREE.Vector3;
+      focusDistance: number;
+      tags: any;
+      footprintArea: number;
+      indoorOutline: THREE.Vector2[];
+      indoorBounds: THREE.Box2;
+      indoorFeatures: ProjectedIndoorFeature[];
+    }> = [];
+    areas.forEach((bld: any, index: number) => {
       if (!bld.geometry || bld.geometry.length < 3) return;
       const shapePoints = bld.geometry.map((pt: any) =>
         new THREE.Vector2((pt.lng - refLng) * scaleX, (pt.lat - refLat) * scaleY)
@@ -1062,19 +2488,120 @@ export function Space() {
       if (!shapePoints[0].equals(shapePoints[shapePoints.length - 1]))
         shapePoints.push(shapePoints[0]);
       const shape = new THREE.Shape(shapePoints);
-      let heightValue = parseFloat(bld.tags.height || "");
-      const heightLevels = parseFloat(bld.tags["building:levels"] || "");
-      if (isNaN(heightValue)) heightValue = 10;
-      if (!isNaN(heightLevels)) heightValue = heightLevels * 2.2;
-      result.push({ shape, extrudeSettings: { steps: 1, depth: heightValue, bevelEnabled: false }, tags: bld.tags });
+      const bounds = new THREE.Box2().setFromPoints(shapePoints);
+      const tags = bld.tags ?? {};
+      const osmHeight = parseOsmHeight(tags.height);
+      const osmLevels = parseOsmLevels(tags["building:levels"]);
+      const requestedFloorCount = osmLevels !== null
+        ? Math.max(1, Math.round(osmLevels))
+        : Math.max(
+            1,
+            Math.round((osmHeight ?? DEFAULT_BUILDING_HEIGHT) / DEFAULT_FLOOR_HEIGHT)
+          );
+      const floorCount = Math.min(requestedFloorCount, MAX_BUILDING_FLOORS);
+      const height = osmHeight ?? (
+        osmLevels !== null
+          ? Math.min(osmLevels, MAX_BUILDING_FLOORS) * REPORTED_LEVEL_HEIGHT
+          : DEFAULT_BUILDING_HEIGHT
+      );
+      const focusTarget = new THREE.Vector3(
+        (bounds.min.x + bounds.max.x) / 2,
+        height / 2,
+        -(bounds.min.y + bounds.max.y) / 2
+      );
+      const focusRadius = Math.max(bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, height, 8);
+      result.push({
+        buildingId: `${bld.id ?? "building"}-${index}`,
+        shape,
+        height,
+        floorCount,
+        reportedFloorCount: osmLevels,
+        heightIsEstimated: osmHeight === null,
+        floorCountIsEstimated: osmLevels === null,
+        focusTarget,
+        focusDistance: Math.max(16, focusRadius * 2.7),
+        tags,
+        footprintArea: Math.abs(THREE.ShapeUtils.area(shapePoints.slice(0, -1))),
+        indoorOutline: shapePoints.slice(0, -1),
+        indoorBounds: bounds,
+        indoorFeatures: [],
+      });
     });
+
+    const projectedIndoorFeatures = indoorFeatures.flatMap((feature) => {
+      const paths = feature.paths.map((path) => ({
+        role: path.role,
+        points: path.points.map(
+          (point) =>
+            new THREE.Vector2(
+              (point.lon - refLng) * scaleX,
+              (point.lat - refLat) * scaleY
+            )
+        ),
+      }));
+      const allPoints = paths.flatMap((path) => path.points);
+      if (allPoints.length === 0) return [];
+      const center = allPoints.reduce(
+        (sum, point) => sum.add(point),
+        new THREE.Vector2()
+      ).multiplyScalar(1 / allPoints.length);
+      return [{ id: feature.id, tags: feature.tags, paths, center }];
+    });
+
+    for (const feature of projectedIndoorFeatures) {
+      const candidate = result
+        .filter((building) => {
+          if (!building.indoorBounds.containsPoint(feature.center)) return false;
+          return (
+            isPointInPolygon(feature.center, building.indoorOutline) ||
+            building.indoorOutline.some(
+              (point) => point.distanceTo(feature.center) < 0.25
+            )
+          );
+        })
+        .sort((a, b) => a.footprintArea - b.footprintArea)[0];
+      candidate?.indoorFeatures.push(feature);
+    }
+
     return result;
-  }, [areas, projection]);
+  }, [areas, indoorFeatures, projection]);
+  const selectedBuilding = buildingsData.find(
+    (item) => item.buildingId === selectedBuildingId
+  );
+  const walkthroughWalls = useMemo(() => {
+    if (!selectedBuilding) return [];
+    const mappedWalls = selectedBuilding.indoorFeatures
+      .filter((feature) => feature.tags.indoor === "wall")
+      .flatMap((feature) =>
+        feature.paths.flatMap((path) =>
+          path.points.slice(1).map((end, index) => [
+            path.points[index],
+            end,
+          ] as [THREE.Vector2, THREE.Vector2])
+        )
+      );
+    return mappedWalls.length > 0 ||
+      selectedBuilding.indoorFeatures.some(hasRenderableIndoorGeometry)
+      ? mappedWalls
+      : generateDemoInterior(selectedBuilding.shape, activeWalkthroughFloor).wallSegments;
+  }, [selectedBuilding, activeWalkthroughFloor]);
 
   return (
-    <Canvas camera={{ fov: 90, near: 0.1, far: 7000 }}>
-      <ambientLight intensity={Math.PI / 2} />
-      <spotLight position={[10, 10, 10]} angle={0.15} penumbra={1} decay={0} intensity={Math.PI} />
+    <div className="mapforge-scene">
+      <Canvas
+        dpr={[1, 1.75]}
+        gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping }}
+        camera={{
+          fov: 55,
+          near: 0.1,
+          far: Math.max(7000, sceneSpan * 8),
+          position: [cameraDistance * 0.72, cameraDistance * 0.82, cameraDistance * 1.1],
+        }}
+      >
+      <color attach="background" args={["#101a28"]} />
+      <ambientLight intensity={0.72} />
+      <hemisphereLight args={["#d7e4f2", "#182437", 0.78]} />
+      <spotLight position={[10, 10, 10]} angle={0.28} penumbra={0.7} decay={0} intensity={1.45} />
       <GroundPlane sceneWidth={groundSceneWidth} sceneDepth={groundSceneDepth} />
       <GreenMeshes />
       <WaterPolygonMeshes />
@@ -1082,19 +2609,55 @@ export function Space() {
       <WaterRibbonMeshes />
       <RailwayMeshes />
       <RoadMeshes />
-      {buildingsData.map((item, index) => (
+      {buildingsData.map((item) => (
         <Building
-          key={index}
+          key={item.buildingId}
+          buildingId={item.buildingId}
           shape={item.shape}
-          extrudeSettings={item.extrudeSettings}
+          height={item.height}
+          floorCount={item.floorCount}
+          reportedFloorCount={item.reportedFloorCount}
+          heightIsEstimated={item.heightIsEstimated}
+          floorCountIsEstimated={item.floorCountIsEstimated}
+          indoorFeatures={item.indoorFeatures}
+          indoorDataStatus={indoorDataStatus}
+          indoorDataError={indoorDataError}
+          onIndoorDataRetry={onIndoorDataRetry}
+          cameraView={cameraView}
+          onCameraViewChange={onCameraViewChange}
+          activeWalkthroughFloor={activeWalkthroughFloor}
+          onWalkthroughFloorChange={setActiveWalkthroughFloor}
+          isSelected={selectedBuildingId === item.buildingId}
+          inspectorOpen={inspectorOpen}
+          onInspectorOpenChange={onInspectorOpenChange}
+          onSelect={(id) => {
+            setSelectedBuildingId((current) => (current === id ? null : id));
+            onCameraViewChange("orbit");
+            if (id) onInspectorOpenChange(true);
+          }}
           tags={item.tags}
         />
       ))}
-      <pointLight position={[-10, -10, -10]} decay={0} intensity={Math.PI} />
-      <Car />
+      <pointLight position={[-10, -10, -10]} decay={0} intensity={0.55} />
+      {cameraView === "walkthrough" && selectedBuilding ? (
+        <FirstPersonWalkthrough
+          key={`${selectedBuilding.buildingId}-${activeWalkthroughFloor}`}
+          shape={selectedBuilding.shape}
+          floorLevel={activeWalkthroughFloor}
+          floorHeight={selectedBuilding.height / selectedBuilding.floorCount}
+          wallSegments={walkthroughWalls}
+          onExit={() => onCameraViewChange("orbit")}
+        />
+      ) : (
+        <Car
+          focusTarget={selectedBuilding?.focusTarget ?? null}
+          focusDistance={selectedBuilding?.focusDistance ?? sceneSpan}
+          topDown={cameraView === "topdown"}
+        />
+      )}
       <Export />
-      <Sky distance={450000} sunPosition={[0, 1, 0]} inclination={0} azimuth={0.25} />
       <Environment preset="city" />
-    </Canvas>
+      </Canvas>
+    </div>
   );
 }
