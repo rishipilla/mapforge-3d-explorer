@@ -22,6 +22,8 @@ import { TopNav } from "@/components/nav/TopNav";
 import { getCookie } from "@/utils/cookie";
 import { Row } from "@/components/flex/Row";
 import instanceFleet from "@/api/axios";
+import { createOverpassClient } from "@/services/overpassClient";
+import { createGenerationWorkflow } from "@/services/generationWorkflow";
 
 const IconSize = css({
   width: "14px",
@@ -107,6 +109,8 @@ function App() {
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const requestControllerRef = useRef<AbortController | null>(null);
   const requestInFlightRef = useRef(false);
+  const generationWorkflowRef = useRef(createGenerationWorkflow());
+  const overpassClientRef = useRef(createOverpassClient());
 
   const buildBoundsFromCenter = (lat: number, lon: number, size: "small" | "medium" | "large") => {
     const dLat = BOX_HALF_LAT[size];
@@ -186,6 +190,9 @@ function App() {
   };
 
   const handleDone = (data) => {
+    // Map move/zoom events can arrive while the generation overlay is opening.
+    // Keep the request's selected bounds stable once generation has started.
+    if (generationWorkflowRef.current.isRunning) return;
     requestControllerRef.current?.abort();
     setFetchError("");
     setAreaData(data);
@@ -199,6 +206,7 @@ function App() {
   };
 
   const handleRemove = () => {
+    if (generationWorkflowRef.current.isRunning) return;
     requestControllerRef.current?.abort();
     setAreaData([]);
     setIsNextButtonDisabled(true);
@@ -308,23 +316,7 @@ function App() {
       `way["railway"="rail"](${bbox});` +
       `way["landuse"="parking"](${bbox});` +
     `);out body geom;`;
-      const response = await fetch("/api/overpass", {
-        method: "POST",
-        body: query,
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-        signal: controller.signal,
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(
-          typeof data.error === "string"
-            ? data.error
-            : `Map data request failed (HTTP ${response.status}).`
-        );
-      }
-      if (!Array.isArray(data.elements)) {
-        throw new Error("The map data service returned an invalid response.");
-      }
+      const data = await overpassClientRef.current.request(query, controller.signal);
 
       const blds: Building[] = data.elements
         .filter((el: any) => el.tags?.building)
@@ -573,19 +565,13 @@ function App() {
     }
   };
 
-  const generate = async () => {
-    setStep(1);
-    const ok = await requestBuildings();
-    if (ok) setStep(2);
-    else setStep(0);
+  const runGeneration = async (returnStep: number) => {
+    return generationWorkflowRef.current.run(requestBuildings, setStep, returnStep);
   };
 
-  const retryIndoorData = async () => {
-    const returnStep = step === 2 ? 2 : 0;
-    setStep(1);
-    const success = await requestBuildings();
-    setStep(success ? 2 : returnStep);
-  };
+  const generate = () => runGeneration(0);
+
+  const retryIndoorData = () => runGeneration(step === 2 ? 2 : 0);
 
   const handleClickNextStep = () => {
     if (step === 0) {

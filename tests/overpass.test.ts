@@ -90,12 +90,15 @@ describe("Overpass API proxy", () => {
 
   test("the browser calls only the same-origin proxy and resets loading in finally", async () => {
     const app = await readFile(new URL("../src/ui/App.tsx", import.meta.url), "utf8");
-    assert.match(app, /fetch\("\/api\/overpass"/);
+    const client = await readFile(new URL("../src/services/overpassClient.ts", import.meta.url), "utf8");
+    assert.match(client, /fetcher\("\/api\/overpass"/);
+    assert.doesNotMatch(client, /https:\/\/overpass-(?:api\.de|kumi\.systems)\/api\/interpreter/);
     assert.doesNotMatch(app, /https:\/\/overpass-(?:api\.de|kumi\.systems)\/api\/interpreter/);
     assert.match(app, /finally\s*\{[\s\S]*?setIsFetchingBuildings\(false\)/);
     assert.match(app, /if \(controller\.signal\.aborted\)[\s\S]*?setBuildStatus\(""\)/);
-    assert.match(app, /const retryIndoorData = async \(\) => \{[\s\S]*?const success = await requestBuildings\(\);/);
-    assert.match(app, /setAreaData\(data\)[\s\S]*?catch \(error\)/);
+    assert.match(app, /createGenerationWorkflow/);
+    assert.match(app, /const handleDone = \(data\) => \{[\s\S]*?if \(generationWorkflowRef\.current\.isRunning\) return;[\s\S]*?requestControllerRef\.current\?\.abort\(\)/);
+    assert.match(app, /const retryIndoorData = \(\) => runGeneration/);
 
     const config = JSON.parse(await readFile(new URL("../vercel.json", import.meta.url), "utf8"));
     assert.equal(config.framework, "vite");
