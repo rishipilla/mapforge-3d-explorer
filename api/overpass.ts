@@ -11,10 +11,46 @@ type ApiResponse = {
 };
 
 const MAX_QUERY_BYTES = 256 * 1024;
-// Two upstream attempts must fit inside the 30 second Vercel function limit.
-const UPSTREAM_TIMEOUT_MS = 12_000;
+// Three upstream attempts must fit inside the 30 second Vercel function limit.
+const UPSTREAM_TIMEOUT_MS = 9_000;
 const DEFAULT_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const DEFAULT_FALLBACK = "https://overpass.kumi.systems/api/interpreter";
+const DEFAULT_FALLBACK_2 = "https://overpass.openstreetmap.ru/api/interpreter";
+
+// Simple in-memory cache: keyed by query text, TTL-based, size-capped.
+// Resets on cold start, which is fine — it just reduces repeat load during a warm instance's life.
+const CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutes
+const CACHE_MAX_ENTRIES = 200;
+const cache = new Map<string, { data: Record<string, unknown>; expiresAt: number }>();
+
+function cacheGet(key: string): Record<string, unknown> | undefined {
+  const entry = cache.get(key);
+  if (!entry) return undefined;
+  if (entry.expiresAt < Date.now()) {
+    cache.delete(key);
+    return undefined;
+  }
+  // refresh recency
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry.data;
+}
+
+function cacheSet(key: string, data: Record<string, unknown>) {
+  if (cache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) cache.delete(oldestKey);
+  }
+  cache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
+async function hashQuery(query: string): Promise<string> {
+  const bytes = new TextEncoder().encode(query);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 function configuredEndpoint(value: string | undefined, fallback: string): string {
   const endpoint = value || fallback;
@@ -39,6 +75,10 @@ function sendJson(res: ApiResponse, status: number, body: Record<string, unknown
   res.send(JSON.stringify(body));
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export default async function overpass(req: ApiRequest, res: ApiResponse) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -57,11 +97,19 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
     return sendJson(res, 413, { error: "The Overpass query exceeds the 256 KB limit." });
   }
 
+  // Serve from cache if we've seen this exact query recently.
+  const cacheKey = await hashQuery(query);
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    return sendJson(res, 200, cached);
+  }
+
   let endpoints: string[];
   try {
     endpoints = [
       configuredEndpoint(process.env.OVERPASS_API_URL, DEFAULT_ENDPOINT),
       configuredEndpoint(process.env.OVERPASS_FALLBACK_URL, DEFAULT_FALLBACK),
+      configuredEndpoint(process.env.OVERPASS_FALLBACK_URL_2, DEFAULT_FALLBACK_2),
     ].filter((endpoint, index, list) => list.indexOf(endpoint) === index);
   } catch {
     return sendJson(res, 500, { error: "Overpass endpoint configuration is invalid." });
@@ -83,7 +131,10 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
     } catch (error) {
       clearTimeout(timeout);
       const isTimeout = error instanceof Error && error.name === "AbortError";
-      if (index + 1 < endpoints.length) continue;
+      if (index + 1 < endpoints.length) {
+        await sleep(300);
+        continue;
+      }
       return sendJson(res, isTimeout ? 504 : 502, {
         error: isTimeout ? "The Overpass service timed out. Please retry." : "The Overpass service could not be reached.",
       });
@@ -92,13 +143,19 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
 
     if (!upstream.ok) {
       if (upstream.status === 429) {
-        if (index + 1 < endpoints.length) continue;
+        if (index + 1 < endpoints.length) {
+          await sleep(300);
+          continue;
+        }
         const retryAfter = upstream.headers.get("retry-after");
         if (retryAfter) res.setHeader("Retry-After", retryAfter);
         return sendJson(res, 429, { error: "Overpass is rate limiting requests. Please wait and retry." });
       }
       const transient = [502, 503, 504].includes(upstream.status);
-      if (transient && index + 1 < endpoints.length) continue;
+      if (transient && index + 1 < endpoints.length) {
+        await sleep(300);
+        continue;
+      }
       return sendJson(res, transient ? 503 : 502, {
         error: `Overpass returned HTTP ${upstream.status}. Please retry later.`,
       });
@@ -113,6 +170,8 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
     if (!data || typeof data !== "object" || !Array.isArray((data as { elements?: unknown }).elements)) {
       return sendJson(res, 502, { error: "Overpass returned an invalid map data response." });
     }
+
+    cacheSet(cacheKey, data as Record<string, unknown>);
     return sendJson(res, 200, data as Record<string, unknown>);
   }
 
