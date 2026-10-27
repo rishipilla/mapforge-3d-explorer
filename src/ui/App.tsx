@@ -105,6 +105,8 @@ function App() {
   const [fetchError, setFetchError] = useState("");
   const mapRef = useRef<MapComponentRef>(null);
   const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const requestControllerRef = useRef<AbortController | null>(null);
+  const requestInFlightRef = useRef(false);
 
   const buildBoundsFromCenter = (lat: number, lon: number, size: "small" | "medium" | "large") => {
     const dLat = BOX_HALF_LAT[size];
@@ -184,6 +186,8 @@ function App() {
   };
 
   const handleDone = (data) => {
+    requestControllerRef.current?.abort();
+    setFetchError("");
     setAreaData(data);
     setCenter(data);
     console.log(data, "AAEE");
@@ -195,6 +199,7 @@ function App() {
   };
 
   const handleRemove = () => {
+    requestControllerRef.current?.abort();
     setAreaData([]);
     setIsNextButtonDisabled(true);
     setBuildings([]);
@@ -229,6 +234,10 @@ function App() {
   };
 
   const requestBuildings = async (): Promise<boolean> => {
+    if (requestInFlightRef.current) return false;
+    requestInFlightRef.current = true;
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
     setIsFetchingBuildings(true);
     setIndoorDataStatus("loading");
     setFetchError("");
@@ -299,36 +308,23 @@ function App() {
       `way["landuse"="parking"](${bbox});` +
     `);out body geom;`;
     try {
-      const endpoints = [
-        import.meta.env.VITE_OVERPASS_API_URL ||
-          "https://overpass-api.de/api/interpreter",
-        import.meta.env.VITE_OVERPASS_FALLBACK_URL ||
-          "https://overpass.kumi.systems/api/interpreter",
-      ].filter((endpoint, index, list) => list.indexOf(endpoint) === index);
-      let response: Response | null = null;
-      const endpointErrors: string[] = [];
-      for (const endpoint of endpoints) {
-        try {
-          const attempt = await fetch(endpoint, {
-            method: "POST",
-            body: query,
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          });
-          if (attempt.ok) {
-            response = attempt;
-            break;
-          }
-          endpointErrors.push(`${endpoint}: HTTP ${attempt.status}`);
-        } catch (error) {
-          endpointErrors.push(
-            `${endpoint}: ${error instanceof Error ? error.message : "request failed"}`
-          );
-        }
+      const response = await fetch("/api/overpass", {
+        method: "POST",
+        body: query,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(
+          typeof data.error === "string"
+            ? data.error
+            : `Map data request failed (HTTP ${response.status}).`
+        );
       }
-      if (!response) {
-        throw new Error(`All Overpass endpoints failed. ${endpointErrors.join("; ")}`);
+      if (!Array.isArray(data.elements)) {
+        throw new Error("The map data service returned an invalid response.");
       }
-      const data = await response.json();
 
       const blds: Building[] = data.elements
         .filter((el: any) => el.tags?.building)
@@ -552,13 +548,18 @@ function App() {
     } catch (error) {
       clearInterval(progressIntervalRef.current!);
       progressIntervalRef.current = null;
+      if (controller.signal.aborted) return false;
       const msg = error instanceof Error ? error.message : "Unknown error";
-      setFetchError(`Failed to fetch map data: ${msg}. Please try again.`);
+      setFetchError(`Failed to fetch map data: ${msg}`);
       setIndoorDataStatus("error");
       setBuildProgress(0);
       setBuildStatus("");
       return false;
     } finally {
+      clearInterval(progressIntervalRef.current!);
+      progressIntervalRef.current = null;
+      requestInFlightRef.current = false;
+      if (requestControllerRef.current === controller) requestControllerRef.current = null;
       setIsFetchingBuildings(false);
     }
   };
@@ -592,6 +593,10 @@ function App() {
 
   useEffect(() => {
     checkFleetLogin();
+    return () => {
+      requestControllerRef.current?.abort();
+      if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+    };
   }, []);
 
   return (
@@ -660,6 +665,7 @@ function App() {
           {fetchError && (
             <div css={css({ color: "#ef4444", fontSize: "13px", padding: "0.5rem 0.75rem", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: "8px" })}>
               {fetchError}
+              <button onClick={retryIndoorData} disabled={isFetchingBuildings} css={css({ marginLeft: "0.5rem", border: 0, background: "transparent", color: "#b91c1c", textDecoration: "underline", cursor: "pointer", fontWeight: 600 })}>Retry</button>
             </div>
           )}
           <div css={css({ display: "flex", alignItems: "center", gap: "0.5rem" })}>

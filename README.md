@@ -80,7 +80,9 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173` in your browser.
+`npm run dev` serves `/api/overpass` through a Vite development middleware that uses the same handler as the Vercel function. Production deployments use `api/overpass.ts` as a Vercel serverless function. Set `OVERPASS_API_URL` and optionally `OVERPASS_FALLBACK_URL` in `.env.local` to configure server-side Overpass endpoints. The API accepts a query body and never forwards arbitrary URLs. You can also run `npx vercel dev` to test Vercel's serverless runtime locally.
+
+Open the local URL printed by Vite in your browser.
 
 ---
 
