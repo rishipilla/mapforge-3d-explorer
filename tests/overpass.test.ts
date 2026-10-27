@@ -26,6 +26,7 @@ function createResponse(): MockResponse {
 const originalFetch = globalThis.fetch;
 const originalPrimary = process.env.OVERPASS_API_URL;
 const originalFallback = process.env.OVERPASS_FALLBACK_URL;
+const originalFallback2 = process.env.OVERPASS_FALLBACK_URL_2;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -33,6 +34,8 @@ afterEach(() => {
   else process.env.OVERPASS_API_URL = originalPrimary;
   if (originalFallback === undefined) delete process.env.OVERPASS_FALLBACK_URL;
   else process.env.OVERPASS_FALLBACK_URL = originalFallback;
+  if (originalFallback2 === undefined) delete process.env.OVERPASS_FALLBACK_URL_2;
+  else process.env.OVERPASS_FALLBACK_URL_2 = originalFallback2;
 });
 
 describe("Overpass API proxy", () => {
@@ -128,6 +131,48 @@ describe("Overpass API proxy", () => {
     assert.equal(calls, 2);
     assert.equal(requestHeaders[0].has("accept"), false);
     assert.equal(requestHeaders[1].has("accept"), false);
+    assert.match(requestHeaders[0].get("user-agent") ?? "", /^MapForge\//);
+  });
+
+  test("reports mixed mirror failures as a clear service error", async () => {
+    process.env.OVERPASS_API_URL = "https://primary.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL = "https://fallback.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL_2 = "https://fallback-2.example/api/interpreter";
+    const query = `mixed-failure-query-${Date.now()}-${Math.random()}`;
+    globalThis.fetch = async (input) => {
+      if (String(input).includes("fallback.example")) {
+        return new Response("temporarily overloaded", { status: 503 });
+      }
+      throw new Error("upstream connection refused");
+    };
+    const response = createResponse();
+
+    await overpass({ method: "POST", body: query }, response);
+
+    assert.equal(response.statusCode, 503);
+    assert.match(response.body ?? "", /All Overpass mirrors are temporarily unavailable/);
+    assert.doesNotMatch(response.body ?? "", /The Overpass mirror could not be reached/);
+  });
+
+  test("uses the LZ4 Overpass mirror as a default fallback", async () => {
+    delete process.env.OVERPASS_API_URL;
+    delete process.env.OVERPASS_FALLBACK_URL;
+    delete process.env.OVERPASS_FALLBACK_URL_2;
+    const query = `default-mirror-query-${Date.now()}-${Math.random()}`;
+    const endpoints: string[] = [];
+    globalThis.fetch = async (input) => {
+      endpoints.push(String(input));
+      throw new Error("upstream unavailable");
+    };
+    const response = createResponse();
+
+    await overpass({ method: "POST", body: query }, response);
+
+    assert.equal(response.statusCode, 502);
+    assert.ok(endpoints.includes("https://overpass-api.de/api/interpreter"));
+    assert.ok(endpoints.includes("https://lz4.overpass-api.de/api/interpreter"));
+    assert.ok(endpoints.includes("https://overpass.kumi.systems/api/interpreter"));
+    assert.ok(!endpoints.includes("https://overpass.openstreetmap.ru/api/interpreter"));
   });
 
   test("starts a fallback mirror before the slow primary reaches its timeout", async () => {

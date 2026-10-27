@@ -17,8 +17,8 @@ const MAX_QUERY_BYTES = 256 * 1024;
 const UPSTREAM_TIMEOUT_MS = 20_000;
 const MIRROR_HEDGE_DELAY_MS = 2_500;
 const DEFAULT_ENDPOINT = "https://overpass-api.de/api/interpreter";
-const DEFAULT_FALLBACK = "https://overpass.kumi.systems/api/interpreter";
-const DEFAULT_FALLBACK_2 = "https://overpass.openstreetmap.ru/api/interpreter";
+const DEFAULT_FALLBACK = "https://lz4.overpass-api.de/api/interpreter";
+const DEFAULT_FALLBACK_2 = "https://overpass.kumi.systems/api/interpreter";
 
 // Simple in-memory cache: keyed by query text, TTL-based, size-capped.
 // Resets on cold start, which is fine — it just reduces repeat load during a warm instance's life.
@@ -88,7 +88,10 @@ async function fetchFromMirror(endpoint: string, query: string, signal: AbortSig
   try {
     upstream = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "User-Agent": "MapForge/0.1.0 (https://mapforge-3d-explorer.vercel.app)",
+      },
       body: query,
       signal,
     });
@@ -141,18 +144,23 @@ function requestOverpass(query: string, endpoints: string[]): Promise<UpstreamOu
     const finishWithFailures = () => {
       const recordedFailures = failures.filter((failure): failure is Extract<UpstreamOutcome, { status: number }> => Boolean(failure));
       const timedOut = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 504);
+      const hasTimeout = recordedFailures.some((failure) => failure.status === 504);
       const rateLimited = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 429);
       const unreachable = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 502);
-      const last = recordedFailures[recordedFailures.length - 1];
+      const transientHttpFailure = recordedFailures.some((failure) => [406, 429, 502, 503, 504].includes(failure.status));
       finish({
-        status: timedOut ? 504 : rateLimited ? 429 : unreachable ? 502 : 503,
+        status: hasTimeout ? 504 : rateLimited ? 429 : unreachable ? 502 : 503,
         error: timedOut
           ? "All Overpass mirrors timed out. Try a smaller map area or retry."
+          : hasTimeout
+            ? "Some Overpass mirrors timed out and the remaining mirrors failed. Please retry or use a smaller map area."
           : rateLimited
             ? "Overpass mirrors are rate limiting requests. Please wait and retry."
             : unreachable
-              ? "Overpass mirrors could not be reached."
-              : last?.error ?? "Overpass mirrors are temporarily unavailable.",
+              ? "Overpass mirrors could not be reached. Check the upstream service and retry."
+              : transientHttpFailure
+                ? "All Overpass mirrors are temporarily unavailable. Please retry shortly."
+                : "All Overpass mirrors returned errors. Please retry shortly.",
         retryAfter: rateLimited ? recordedFailures.find((failure) => failure.retryAfter)?.retryAfter : undefined,
       });
     };
