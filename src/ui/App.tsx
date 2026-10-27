@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 8091)
-Total output lines: 825
-
 import { css, keyframes } from "@emotion/react";
 import { Space } from "../three/Space";
 import { FullscreenModal } from "../components/FullscreenModal";
@@ -372,7 +369,104 @@ function App() {
           for (const member of element.members) {
             if (!Array.isArray(member.geometry) || member.geometry.length < 2) continue;
             paths.push({
-              rol…1091 tokens truncated….waterway === "stream" && el.geometry?.length >= 2
+              role: member.role || "line",
+              points: member.geometry.map((point: any) => ({
+                lat: point.lat,
+                lon: point.lon,
+              })),
+            });
+          }
+        }
+
+        return [{ id: element.id, type: element.type, tags, paths }];
+      });
+
+      const rdElems = data.elements
+        .filter((el: any) => el.tags?.highway && el.geometry?.length >= 2)
+        .map((el: any) => ({
+          id: el.id,
+          tags: el.tags,
+          geometry: el.geometry.map((pt: any) => ({ lat: pt.lat, lon: pt.lon })),
+        }));
+
+      // ── Phase 1: Parks (leisure=park + landuse=grass + natural=grassland) ──
+      const parkElems = data.elements.filter(
+        (el: any) =>
+          el.tags?.leisure === "park" ||
+          el.tags?.landuse === "grass" ||
+          el.tags?.natural === "grassland"
+      );
+      const parsedParks: PolygonRing[] = toPolygonRings(parkElems);
+
+      // ── Phase 1: Water polygons (natural=water) ──────────────────────────
+      const waterPolyElems = data.elements.filter(
+        (el: any) => el.tags?.natural === "water"
+      );
+
+      // ── Diagnostic: water polygon extraction ─────────────────────────────
+      {
+        const waterWays = waterPolyElems.filter((e: any) => e.type === "way");
+        const waterRels = waterPolyElems.filter((e: any) => e.type === "relation");
+        console.group(`Water polygons diagnostic (${waterPolyElems.length} total)`);
+        console.log(`  ways:      ${waterWays.length}`);
+        console.log(`  relations: ${waterRels.length}`);
+
+        let relSucceeded = 0;
+        let relSkipped = 0;
+        for (const rel of waterRels) {
+          const members = Array.isArray(rel.members) ? rel.members : [];
+          const outerWithGeom  = members.filter((m: any) => m.role === "outer" && m.geometry?.length >= 3);
+          const outerNoGeom    = members.filter((m: any) => m.role === "outer" && !(m.geometry?.length >= 3));
+          const innerCount     = members.filter((m: any) => m.role === "inner").length;
+          const otherCount     = members.filter((m: any) => m.role !== "outer" && m.role !== "inner").length;
+
+          if (outerWithGeom.length > 0) {
+            relSucceeded++;
+          } else {
+            relSkipped++;
+          }
+
+          console.group(
+            `  relation ${rel.id} "${rel.tags?.name ?? "(unnamed)"}" — ` +
+            `outer: ${outerWithGeom.length} ok / ${outerNoGeom.length} no-geom, ` +
+            `inner: ${innerCount}, other-role: ${otherCount}`
+          );
+          if (outerNoGeom.length > 0) {
+            console.warn(`    ⚠ ${outerNoGeom.length} outer member(s) missing geometry:`,
+              outerNoGeom.map((m: any) => ({ ref: m.ref, role: m.role, geomLen: m.geometry?.length ?? 0 }))
+            );
+          }
+          if (members.length === 0) {
+            console.warn(`    ⚠ relation has no members at all — out body geom may not have returned member geometry`);
+          }
+          console.groupEnd();
+        }
+
+        console.log(`  ─────────────────────────────`);
+        console.log(`  relations succeeded (≥1 outer ring): ${relSucceeded}`);
+        console.log(`  relations skipped   (0 outer rings):  ${relSkipped}`);
+        console.groupEnd();
+      }
+
+      const parsedWaterPolygons: PolygonRing[] = toPolygonRings(waterPolyElems);
+
+      // ── Phase 2: Rivers (waterway=river|canal) ────────────────────────────
+      const riverElems: PolylineElem[] = data.elements
+        .filter(
+          (el: any) =>
+            (el.tags?.waterway === "river" || el.tags?.waterway === "canal") &&
+            el.geometry?.length >= 2
+        )
+        .map((el: any) => ({
+          id: el.id,
+          tags: el.tags,
+          geometry: el.geometry.map((pt: any) => ({ lat: pt.lat, lon: pt.lon })),
+        }));
+
+      // ── Phase 2: Streams ──────────────────────────────────────────────────
+      const streamElems: PolylineElem[] = data.elements
+        .filter(
+          (el: any) => el.tags?.waterway === "stream" && el.geometry?.length >= 2
         )
         .map((el: any) => ({
           id: el.id,
