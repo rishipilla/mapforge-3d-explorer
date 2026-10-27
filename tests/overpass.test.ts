@@ -70,6 +70,7 @@ describe("Overpass API proxy", () => {
   test("falls back on a failed upstream and reports unavailable services", async () => {
     process.env.OVERPASS_API_URL = "https://overpass.example/api/interpreter";
     process.env.OVERPASS_FALLBACK_URL = "https://fallback.example/api/interpreter";
+    const query = `fallback-query-${Date.now()}-${Math.random()}`;
     let calls = 0;
     globalThis.fetch = async () => {
       calls += 1;
@@ -77,15 +78,56 @@ describe("Overpass API proxy", () => {
       return new Response(JSON.stringify({ elements: [] }), { status: 200 });
     };
     const response = createResponse();
-    await overpass({ method: "POST", body: "query" }, response);
+    await overpass({ method: "POST", body: query }, response);
     assert.equal(response.statusCode, 200);
     assert.equal(calls, 2);
 
     globalThis.fetch = async () => { throw new Error("all upstreams unavailable"); };
     const failedResponse = createResponse();
-    await overpass({ method: "POST", body: "query" }, failedResponse);
+    await overpass({ method: "POST", body: `${query}-failed` }, failedResponse);
     assert.equal(failedResponse.statusCode, 502);
     assert.match(failedResponse.body ?? "", /could not be reached/);
+  });
+
+  test("hashes cache keys with Node crypto and serves repeated queries from cache", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ elements: [{ id: `cached-${calls}` }] }), { status: 200 });
+    };
+    const query = `cache-query-${Date.now()}-${Math.random()}`;
+    const firstResponse = createResponse();
+    const secondResponse = createResponse();
+
+    await overpass({ method: "POST", body: query }, firstResponse);
+    await overpass({ method: "POST", body: query }, secondResponse);
+
+    assert.equal(firstResponse.statusCode, 200);
+    assert.equal(secondResponse.statusCode, 200);
+    assert.equal(calls, 1);
+    assert.deepEqual(JSON.parse(secondResponse.body ?? "{}"), JSON.parse(firstResponse.body ?? "{}"));
+  });
+
+  test("falls through after an upstream 406 and does not send an Accept header", async () => {
+    process.env.OVERPASS_API_URL = "https://overpass.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL = "https://fallback.example/api/interpreter";
+    const query = `not-acceptable-query-${Date.now()}-${Math.random()}`;
+    const requestHeaders: Headers[] = [];
+    let calls = 0;
+    globalThis.fetch = async (_input, init) => {
+      calls += 1;
+      requestHeaders.push(new Headers(init?.headers));
+      if (calls === 1) return new Response("Not Acceptable", { status: 406 });
+      return new Response(JSON.stringify({ elements: [] }), { status: 200 });
+    };
+    const response = createResponse();
+
+    await overpass({ method: "POST", body: query }, response);
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(calls, 2);
+    assert.equal(requestHeaders[0].has("accept"), false);
+    assert.equal(requestHeaders[1].has("accept"), false);
   });
 
   test("the browser calls only the same-origin proxy and resets loading in finally", async () => {

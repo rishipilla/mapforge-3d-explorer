@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 type ApiRequest = {
   method?: string;
   body?: unknown;
@@ -44,12 +46,8 @@ function cacheSet(key: string, data: Record<string, unknown>) {
   cache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
-async function hashQuery(query: string): Promise<string> {
-  const bytes = new TextEncoder().encode(query);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+function hashQuery(query: string): string {
+  return createHash("sha256").update(query).digest("hex");
 }
 
 function configuredEndpoint(value: string | undefined, fallback: string): string {
@@ -98,7 +96,7 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
   }
 
   // Serve from cache if we've seen this exact query recently.
-  const cacheKey = await hashQuery(query);
+  const cacheKey = hashQuery(query);
   const cached = cacheGet(cacheKey);
   if (cached) {
     return sendJson(res, 200, cached);
@@ -123,7 +121,7 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
     try {
       upstream = await fetch(endpoints[index], {
         method: "POST",
-        headers: { "Content-Type": "text/plain; charset=utf-8", Accept: "application/json" },
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
         body: query,
         signal: controller.signal,
       });
@@ -151,7 +149,7 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
         if (retryAfter) res.setHeader("Retry-After", retryAfter);
         return sendJson(res, 429, { error: "Overpass is rate limiting requests. Please wait and retry." });
       }
-      const transient = [502, 503, 504].includes(upstream.status);
+      const transient = [406, 502, 503, 504].includes(upstream.status);
       if (transient && index + 1 < endpoints.length) {
         await sleep(300);
         continue;
