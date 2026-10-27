@@ -13,8 +13,9 @@ type ApiResponse = {
 };
 
 const MAX_QUERY_BYTES = 256 * 1024;
-// Three upstream attempts must fit inside the 30 second Vercel function limit.
-const UPSTREAM_TIMEOUT_MS = 9_000;
+// Three 20s attempts are hedged over 5s, keeping the worst case under Vercel's 30s limit.
+const UPSTREAM_TIMEOUT_MS = 20_000;
+const MIRROR_HEDGE_DELAY_MS = 2_500;
 const DEFAULT_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const DEFAULT_FALLBACK = "https://overpass.kumi.systems/api/interpreter";
 const DEFAULT_FALLBACK_2 = "https://overpass.openstreetmap.ru/api/interpreter";
@@ -73,8 +74,122 @@ function sendJson(res: ApiResponse, status: number, body: Record<string, unknown
   res.send(JSON.stringify(body));
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+type UpstreamOutcome =
+  | { data: Record<string, unknown> }
+  | { status: number; error: string; retryAfter?: string };
+
+function isRetryableUpstreamStatus(status: number) {
+  return [406, 429, 502, 503, 504].includes(status);
+}
+
+async function fetchFromMirror(endpoint: string, query: string, signal: AbortSignal): Promise<UpstreamOutcome> {
+  let upstream: Response;
+  let responseText: string;
+  try {
+    upstream = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+      body: query,
+      signal,
+    });
+    responseText = await upstream.text();
+  } catch (error) {
+    const timedOut = signal.aborted || (error instanceof Error && error.name === "AbortError");
+    return {
+      status: timedOut ? 504 : 502,
+      error: timedOut ? "The Overpass mirror timed out." : "The Overpass mirror could not be reached.",
+    };
+  }
+
+  if (!upstream.ok) {
+    return {
+      status: upstream.status,
+      error: `Overpass returned HTTP ${upstream.status}.`,
+      retryAfter: upstream.headers.get("retry-after") ?? undefined,
+    };
+  }
+
+  let data: unknown;
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    return { status: 502, error: "Overpass returned malformed JSON." };
+  }
+  if (!data || typeof data !== "object" || !Array.isArray((data as { elements?: unknown }).elements)) {
+    return { status: 502, error: "Overpass returned an invalid map data response." };
+  }
+  return { data: data as Record<string, unknown> };
+}
+
+function requestOverpass(query: string, endpoints: string[]): Promise<UpstreamOutcome> {
+  return new Promise((resolve) => {
+    const controllers: AbortController[] = [];
+    const failures: Array<Extract<UpstreamOutcome, { status: number }> | undefined> = [];
+    const hedgeTimers: ReturnType<typeof setTimeout>[] = [];
+    let nextEndpoint = 0;
+    let activeRequests = 0;
+    let settled = false;
+
+    const finish = (outcome: UpstreamOutcome) => {
+      if (settled) return;
+      settled = true;
+      hedgeTimers.forEach(clearTimeout);
+      controllers.forEach((controller) => controller.abort());
+      resolve(outcome);
+    };
+
+    const finishWithFailures = () => {
+      const recordedFailures = failures.filter((failure): failure is Extract<UpstreamOutcome, { status: number }> => Boolean(failure));
+      const timedOut = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 504);
+      const rateLimited = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 429);
+      const unreachable = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 502);
+      const last = recordedFailures[recordedFailures.length - 1];
+      finish({
+        status: timedOut ? 504 : rateLimited ? 429 : unreachable ? 502 : 503,
+        error: timedOut
+          ? "All Overpass mirrors timed out. Try a smaller map area or retry."
+          : rateLimited
+            ? "Overpass mirrors are rate limiting requests. Please wait and retry."
+            : unreachable
+              ? "Overpass mirrors could not be reached."
+              : last?.error ?? "Overpass mirrors are temporarily unavailable.",
+        retryAfter: rateLimited ? recordedFailures.find((failure) => failure.retryAfter)?.retryAfter : undefined,
+      });
+    };
+
+    const startNext = () => {
+      if (settled || nextEndpoint >= endpoints.length) return;
+      const index = nextEndpoint++;
+      const controller = new AbortController();
+      controllers.push(controller);
+      activeRequests += 1;
+      const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+
+      void fetchFromMirror(endpoints[index], query, controller.signal)
+        .then((outcome) => {
+          if ("data" in outcome) {
+            finish(outcome);
+            return;
+          }
+          failures[index] = outcome;
+          if (!isRetryableUpstreamStatus(outcome.status)) {
+            finish(outcome);
+          }
+        })
+        .finally(() => {
+          clearTimeout(timeout);
+          activeRequests -= 1;
+          if (settled) return;
+          if (nextEndpoint < endpoints.length && failures[index]) startNext();
+          if (nextEndpoint === endpoints.length && activeRequests === 0) finishWithFailures();
+        });
+    };
+
+    startNext();
+    for (let index = 1; index < endpoints.length; index += 1) {
+      hedgeTimers.push(setTimeout(startNext, MIRROR_HEDGE_DELAY_MS * index));
+    }
+  });
 }
 
 export default async function overpass(req: ApiRequest, res: ApiResponse) {
@@ -113,65 +228,11 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
     return sendJson(res, 500, { error: "Overpass endpoint configuration is invalid." });
   }
 
-  for (let index = 0; index < endpoints.length; index += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-    let upstream: Response;
-    let responseText: string;
-    try {
-      upstream = await fetch(endpoints[index], {
-        method: "POST",
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-        body: query,
-        signal: controller.signal,
-      });
-      responseText = await upstream.text();
-    } catch (error) {
-      clearTimeout(timeout);
-      const isTimeout = error instanceof Error && error.name === "AbortError";
-      if (index + 1 < endpoints.length) {
-        await sleep(300);
-        continue;
-      }
-      return sendJson(res, isTimeout ? 504 : 502, {
-        error: isTimeout ? "The Overpass service timed out. Please retry." : "The Overpass service could not be reached.",
-      });
-    }
-    clearTimeout(timeout);
-
-    if (!upstream.ok) {
-      if (upstream.status === 429) {
-        if (index + 1 < endpoints.length) {
-          await sleep(300);
-          continue;
-        }
-        const retryAfter = upstream.headers.get("retry-after");
-        if (retryAfter) res.setHeader("Retry-After", retryAfter);
-        return sendJson(res, 429, { error: "Overpass is rate limiting requests. Please wait and retry." });
-      }
-      const transient = [406, 502, 503, 504].includes(upstream.status);
-      if (transient && index + 1 < endpoints.length) {
-        await sleep(300);
-        continue;
-      }
-      return sendJson(res, transient ? 503 : 502, {
-        error: `Overpass returned HTTP ${upstream.status}. Please retry later.`,
-      });
-    }
-
-    let data: unknown;
-    try {
-      data = JSON.parse(responseText);
-    } catch {
-      return sendJson(res, 502, { error: "Overpass returned malformed JSON." });
-    }
-    if (!data || typeof data !== "object" || !Array.isArray((data as { elements?: unknown }).elements)) {
-      return sendJson(res, 502, { error: "Overpass returned an invalid map data response." });
-    }
-
-    cacheSet(cacheKey, data as Record<string, unknown>);
-    return sendJson(res, 200, data as Record<string, unknown>);
+  const outcome = await requestOverpass(query, endpoints);
+  if ("data" in outcome) {
+    cacheSet(cacheKey, outcome.data);
+    return sendJson(res, 200, outcome.data);
   }
-
-  return sendJson(res, 503, { error: "Overpass is temporarily unavailable. Please retry." });
+  if (outcome.retryAfter) res.setHeader("Retry-After", outcome.retryAfter);
+  return sendJson(res, outcome.status, { error: outcome.error });
 }

@@ -130,6 +130,31 @@ describe("Overpass API proxy", () => {
     assert.equal(requestHeaders[1].has("accept"), false);
   });
 
+  test("starts a fallback mirror before the slow primary reaches its timeout", async () => {
+    process.env.OVERPASS_API_URL = "https://slow.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL = "https://fast.example/api/interpreter";
+    const query = `hedged-query-${Date.now()}-${Math.random()}`;
+    const called: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const endpoint = String(input);
+      called.push(endpoint);
+      if (endpoint.includes("slow.example")) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+        });
+      }
+      return new Response(JSON.stringify({ elements: [{ id: 7 }] }), { status: 200 });
+    };
+    const response = createResponse();
+
+    await overpass({ method: "POST", body: query }, response);
+
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(JSON.parse(response.body ?? "{}").elements, [{ id: 7 }]);
+    assert.ok(called.includes("https://slow.example/api/interpreter"));
+    assert.ok(called.includes("https://fast.example/api/interpreter"));
+  });
+
   test("the browser calls only the same-origin proxy and resets loading in finally", async () => {
     const app = await readFile(new URL("../src/ui/App.tsx", import.meta.url), "utf8");
     const client = await readFile(new URL("../src/services/overpassClient.ts", import.meta.url), "utf8");
@@ -138,6 +163,8 @@ describe("Overpass API proxy", () => {
     assert.doesNotMatch(app, /https:\/\/overpass-(?:api\.de|kumi\.systems)\/api\/interpreter/);
     assert.match(app, /finally\s*\{[\s\S]*?setIsFetchingBuildings\(false\)/);
     assert.match(app, /if \(controller\.signal\.aborted\)[\s\S]*?setBuildStatus\(""\)/);
+    assert.match(app, /const query = `\[out:json\]\[timeout:25\]/);
+    assert.doesNotMatch(app, /nwr\["level"\]/);
     assert.match(app, /createGenerationWorkflow/);
     assert.match(app, /const handleDone = \(data\) => \{[\s\S]*?if \(generationWorkflowRef\.current\.isRunning\) return;[\s\S]*?requestControllerRef\.current\?\.abort\(\)/);
     assert.match(app, /const retryIndoorData = \(\) => runGeneration/);
