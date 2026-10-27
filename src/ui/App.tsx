@@ -250,6 +250,7 @@ function App() {
       setBuildProgress(p);
     }, 200);
 
+    try {
     const south = areaData[1].lat;
     const west = areaData[1].lng;
     const north = areaData[0].lat;
@@ -307,7 +308,6 @@ function App() {
       `way["railway"="rail"](${bbox});` +
       `way["landuse"="parking"](${bbox});` +
     `);out body geom;`;
-    try {
       const response = await fetch("/api/overpass", {
         method: "POST",
         body: query,
@@ -548,7 +548,12 @@ function App() {
     } catch (error) {
       clearInterval(progressIntervalRef.current!);
       progressIntervalRef.current = null;
-      if (controller.signal.aborted) return false;
+      if (controller.signal.aborted) {
+        setBuildProgress(0);
+        setBuildStatus("");
+        setIndoorDataStatus("idle");
+        return false;
+      }
       const msg = error instanceof Error ? error.message : "Unknown error";
       setFetchError(`Failed to fetch map data: ${msg}`);
       setIndoorDataStatus("error");
@@ -561,6 +566,10 @@ function App() {
       requestInFlightRef.current = false;
       if (requestControllerRef.current === controller) requestControllerRef.current = null;
       setIsFetchingBuildings(false);
+      if (controller.signal.aborted) {
+        setBuildProgress(0);
+        setBuildStatus("");
+      }
     }
   };
 
@@ -572,8 +581,10 @@ function App() {
   };
 
   const retryIndoorData = async () => {
+    const returnStep = step === 2 ? 2 : 0;
+    setStep(1);
     const success = await requestBuildings();
-    if (success) setStep(2);
+    setStep(success ? 2 : returnStep);
   };
 
   const handleClickNextStep = () => {

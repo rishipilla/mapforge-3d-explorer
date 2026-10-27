@@ -11,7 +11,8 @@ type ApiResponse = {
 };
 
 const MAX_QUERY_BYTES = 256 * 1024;
-const UPSTREAM_TIMEOUT_MS = 25_000;
+// Two upstream attempts must fit inside the 30 second Vercel function limit.
+const UPSTREAM_TIMEOUT_MS = 12_000;
 const DEFAULT_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const DEFAULT_FALLBACK = "https://overpass.kumi.systems/api/interpreter";
 
@@ -59,8 +60,8 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
   let endpoints: string[];
   try {
     endpoints = [
-      configuredEndpoint(process.env.OVERPASS_API_URL || process.env.VITE_OVERPASS_API_URL, DEFAULT_ENDPOINT),
-      configuredEndpoint(process.env.OVERPASS_FALLBACK_URL || process.env.VITE_OVERPASS_FALLBACK_URL, DEFAULT_FALLBACK),
+      configuredEndpoint(process.env.OVERPASS_API_URL, DEFAULT_ENDPOINT),
+      configuredEndpoint(process.env.OVERPASS_FALLBACK_URL, DEFAULT_FALLBACK),
     ].filter((endpoint, index, list) => list.indexOf(endpoint) === index);
   } catch {
     return sendJson(res, 500, { error: "Overpass endpoint configuration is invalid." });
@@ -91,6 +92,7 @@ export default async function overpass(req: ApiRequest, res: ApiResponse) {
 
     if (!upstream.ok) {
       if (upstream.status === 429) {
+        if (index + 1 < endpoints.length) continue;
         const retryAfter = upstream.headers.get("retry-after");
         if (retryAfter) res.setHeader("Retry-After", retryAfter);
         return sendJson(res, 429, { error: "Overpass is rate limiting requests. Please wait and retry." });
