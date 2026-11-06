@@ -34,6 +34,10 @@ const spinAnimation = keyframes`
 from { transform: rotate(0deg); }
 to { transform: rotate(360deg); }
 `;
+const indeterminateProgress = keyframes`
+0% { transform: translateX(-110%); }
+100% { transform: translateX(340%); }
+`;
 
 // ── OSM polygon helpers ────────────────────────────────────────────────────────
 
@@ -247,16 +251,10 @@ function App() {
     const controller = new AbortController();
     requestControllerRef.current = controller;
     setIsFetchingBuildings(true);
-    setIndoorDataStatus("loading");
+    setIndoorDataStatus("idle");
     setFetchError("");
     setBuildProgress(0);
     setBuildStatus("Fetching map data from OpenStreetMap...");
-
-    let p = 0;
-    progressIntervalRef.current = setInterval(() => {
-      p = p + (85 - p) * 0.05;
-      setBuildProgress(p);
-    }, 200);
 
     try {
     const south = areaData[1].lat;
@@ -282,7 +280,7 @@ function App() {
     });
 
     const bbox = `${south},${west},${north},${east}`;
-    const query = `[out:json][timeout:25];(` +
+    const _legacyQuery = `[out:json][timeout:25];(` +
       // ── existing ──────────────────────────────────────
       `way["building"](${bbox});` +
       `relation["building"](${bbox});` +
@@ -315,10 +313,15 @@ function App() {
       `way["railway"="rail"](${bbox});` +
       `way["landuse"="parking"](${bbox});` +
     `);out body geom;`;
-      const data = await overpassClientRef.current.request(query, controller.signal);
+      void _legacyQuery;
+      const query = `[out:json][timeout:15];(way["building"](${bbox});relation["building"](${bbox}););out body geom;`;
+      let data = await overpassClientRef.current.request(query, controller.signal);
+      setBuildProgress(45);
+      setBuildStatus("Processing building geometry…");
 
       const blds: Building[] = data.elements
-        .filter((el: any) => el.tags?.building)
+        .filter((el: any) => el.tags?.building && el.type === "way" && Array.isArray(el.geometry) && el.geometry.length >= 4)
+        .filter((el: any, index: number, all: any[]) => all.findIndex((other) => other.id === el.id) === index)
         .map((element: any) => ({
           id: element.id,
           tags: element.tags,
@@ -326,6 +329,26 @@ function App() {
             ? element.geometry.map((pt: any) => ({ lat: pt.lat, lng: pt.lon }))
             : undefined,
         }));
+
+      if (controller.signal.aborted) return false;
+      if (blds.length === 0) throw new Error("No valid building footprints were found in this area. Select a smaller or denser area and retry.");
+      setBuildProgress(70);
+      setBuildStatus(`Rendering ${blds.length} buildings…`);
+      setBuildings(blds);
+      appendAreas(blds);
+      setHasFetchedBuildings(true);
+      setStep(2);
+
+      const extrasQuery = `[out:json][timeout:12];(way["highway"](${bbox});way["natural"="water"](${bbox});relation["natural"="water"](${bbox});way["waterway"~"^(river|stream|canal)$"](${bbox});way["natural"="wood"](${bbox});way["landuse"="forest"](${bbox});way["landuse"="grass"](${bbox});way["natural"="grassland"](${bbox});way["leisure"="park"](${bbox});relation["leisure"="park"](${bbox});way["railway"="rail"](${bbox}););out body geom;`;
+      try {
+        data = await overpassClientRef.current.request(extrasQuery, controller.signal);
+      } catch (optionalError) {
+        if (controller.signal.aborted) return true;
+        console.warn("Optional map layers failed to load:", optionalError);
+        setFetchError("Buildings are ready, but optional map layers could not be loaded.");
+        data = { elements: [] };
+      }
+      setBuildStatus("Loading optional map layers…");
 
       const indoorFeatures: IndoorFeature[] = data.elements.flatMap((element: any) => {
         const tags = element.tags ?? {};
@@ -515,8 +538,6 @@ function App() {
       console.log(`  total elements: ${els.length}`);
       console.groupEnd();
 
-      setBuildings(blds);
-      appendAreas(blds);
       setRoads(rdElems);
       setIndoorFeatures(indoorFeatures);
       setParks(parsedParks);
@@ -525,16 +546,10 @@ function App() {
       setStreams(streamElems);
       setForests(parsedForests);
       setRailways(railwayElems);
-      setIndoorDataStatus("loaded");
-      setHasFetchedBuildings(true);
-
-      clearInterval(progressIntervalRef.current!);
-      progressIntervalRef.current = null;
-      setBuildStatus("Building 3D scene...");
-      setBuildProgress(92);
-      await new Promise((r) => setTimeout(r, 500));
+      setIndoorDataStatus("idle");
+      setBuildStatus("Finalizing scene…");
       setBuildProgress(100);
-      await new Promise((r) => setTimeout(r, 300));
+      setBuildStatus("Buildings ready");
       return true;
     } catch (error) {
       clearInterval(progressIntervalRef.current!);
@@ -604,6 +619,12 @@ function App() {
         onInspectorToggle={() => setInspectorOpen((open) => !open)}
         onSettingsClick={() => setIsExportModal(true)}
       />
+      {fetchError && step === 2 && (
+        <div role="status" css={css({ position: "absolute", zIndex: 10000, top: "4.5rem", left: "50%", transform: "translateX(-50%)", padding: "0.65rem 0.9rem", borderRadius: 8, background: "#fff7ed", color: "#9a3412", border: "1px solid #fed7aa", boxShadow: "0 4px 16px rgba(0,0,0,.18)" })}>
+          {fetchError}
+          <button onClick={() => setFetchError("")} css={css({ marginLeft: "0.75rem", border: 0, background: "transparent", color: "inherit", textDecoration: "underline", cursor: "pointer" })}>Dismiss</button>
+        </div>
+      )}
 
       <FullscreenModal isOpen={steps[step] == "front"}>
         <Column gap="1rem">
@@ -709,20 +730,25 @@ function App() {
             <Title>Generating 3D Map</Title>
             <Description>{buildStatus}</Description>
           </Column>
+          {hasFetchedBuildings && <Description>{buildings.length} building footprints processed</Description>}
           <div css={css({ width: "100%" })}>
             <div css={css({ background: "#e5e7eb", borderRadius: "100px", height: "8px", overflow: "hidden" })}>
               <div css={css({
-                width: `${buildProgress}%`,
+                width: buildStatus.toLowerCase().includes("loading optional") ? "30%" : `${buildProgress}%`,
                 height: "100%",
                 background: "linear-gradient(90deg, #007bff, #0057cc)",
                 borderRadius: "100px",
                 transition: "width 0.25s ease",
+                animation: buildStatus.toLowerCase().includes("loading optional") ? `${indeterminateProgress} 1.2s ease-in-out infinite` : "none",
               })} />
             </div>
             <div css={css({ marginTop: "0.5rem", fontSize: "13px", color: "#9aa0a6", textAlign: "right" })}>
-              {Math.round(buildProgress)}%
+              {buildStatus.toLowerCase().includes("loading optional") ? "Waiting for optional layers" : `${Math.round(buildProgress)}%`}
             </div>
           </div>
+          <Button isShow={isFetchingBuildings} onClick={() => requestControllerRef.current?.abort()}>
+            Cancel generation
+          </Button>
         </Column>
       </FullscreenModal>
 

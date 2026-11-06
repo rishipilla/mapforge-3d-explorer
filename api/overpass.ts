@@ -147,6 +147,7 @@ function requestOverpass(query: string, endpoints: string[]): Promise<UpstreamOu
       const hasTimeout = recordedFailures.some((failure) => failure.status === 504);
       const rateLimited = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 429);
       const unreachable = recordedFailures.length > 0 && recordedFailures.every((failure) => failure.status === 502);
+      const malformedResponse = recordedFailures.some((failure) => /malformed JSON|invalid map data response/i.test(failure.error));
       const transientHttpFailure = recordedFailures.some((failure) => [406, 429, 502, 503, 504].includes(failure.status));
       finish({
         status: hasTimeout ? 504 : rateLimited ? 429 : unreachable ? 502 : 503,
@@ -156,7 +157,9 @@ function requestOverpass(query: string, endpoints: string[]): Promise<UpstreamOu
             ? "Some Overpass mirrors timed out and the remaining mirrors failed. Please retry or use a smaller map area."
           : rateLimited
             ? "Overpass mirrors are rate limiting requests. Please wait and retry."
-            : unreachable
+          : malformedResponse
+            ? "Overpass returned malformed or invalid map data. Please retry shortly."
+          : unreachable
               ? "Overpass mirrors could not be reached. Check the upstream service and retry."
               : transientHttpFailure
                 ? "All Overpass mirrors are temporarily unavailable. Please retry shortly."

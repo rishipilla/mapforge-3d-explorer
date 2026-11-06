@@ -154,6 +154,28 @@ describe("Overpass API proxy", () => {
     assert.doesNotMatch(response.body ?? "", /The Overpass mirror could not be reached/);
   });
 
+  test("reports an upstream HTTP 504 as a retryable timeout", async () => {
+    process.env.OVERPASS_API_URL = "https://timeout-primary.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL = "https://timeout-fallback.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL_2 = "https://timeout-third.example/api/interpreter";
+    globalThis.fetch = async () => new Response("Gateway Timeout", { status: 504 });
+    const response = createResponse();
+    await overpass({ method: "POST", body: `timeout-${Date.now()}` }, response);
+    assert.equal(response.statusCode, 504);
+    assert.match(response.body ?? "", /timed out/);
+  });
+
+  test("rejects malformed upstream JSON with a clear gateway error", async () => {
+    process.env.OVERPASS_API_URL = "https://malformed.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL = "https://malformed-fallback.example/api/interpreter";
+    process.env.OVERPASS_FALLBACK_URL_2 = "https://malformed-third.example/api/interpreter";
+    globalThis.fetch = async () => new Response("<html>busy</html>", { status: 200 });
+    const response = createResponse();
+    await overpass({ method: "POST", body: `malformed-${Date.now()}` }, response);
+    assert.equal(response.statusCode, 502);
+    assert.match(response.body ?? "", /malformed.*(?:JSON|map data)/i);
+  });
+
   test("uses the LZ4 Overpass mirror as a default fallback", async () => {
     delete process.env.OVERPASS_API_URL;
     delete process.env.OVERPASS_FALLBACK_URL;
@@ -208,7 +230,11 @@ describe("Overpass API proxy", () => {
     assert.doesNotMatch(app, /https:\/\/overpass-(?:api\.de|kumi\.systems)\/api\/interpreter/);
     assert.match(app, /finally\s*\{[\s\S]*?setIsFetchingBuildings\(false\)/);
     assert.match(app, /if \(controller\.signal\.aborted\)[\s\S]*?setBuildStatus\(""\)/);
-    assert.match(app, /const query = `\[out:json\]\[timeout:25\]/);
+    assert.match(app, /const query = `\[out:json\]\[timeout:15\]/);
+    assert.match(app, /const extrasQuery = `\[out:json\]\[timeout:12\]/);
+    assert.match(app, /setStep\(2\);[\s\S]*?const extrasQuery/);
+    assert.doesNotMatch(app, /p = p \+ \(85 - p\)/);
+    assert.match(app, /Cancel generation/);
     assert.doesNotMatch(app, /nwr\["level"\]/);
     assert.match(app, /createGenerationWorkflow/);
     assert.match(app, /const handleDone = \(data\) => \{[\s\S]*?if \(generationWorkflowRef\.current\.isRunning\) return;[\s\S]*?requestControllerRef\.current\?\.abort\(\)/);
